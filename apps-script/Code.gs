@@ -41,6 +41,25 @@ var CATEGORY_KEYWORDS = {
                     'HOSPITAL', 'POLYCLINIC']
 };
 
+// ── Citi Rewards: confirmed-online merchants — earn 4 mpd ────
+// Per T&C, Citi Rewards 10X applies ONLY to:
+//   (a) online retail transactions (any non-travel merchant, online channel)
+//   (b) physical clothing/shoes/bags stores (specific MCCs)
+// Since emails don't reveal the MCC, we whitelist known-online merchants.
+// Everything else (physical restaurants, groceries, transport) earns 0.4 mpd
+// UNLESS the transaction went via Amaze (which forces online MCC processing).
+var CITI_ONLINE_KEYWORDS = [
+  // Food delivery apps — MCC 5812/5814 via online channel
+  'FOODPANDA', 'FOOD PANDA', 'FP*', 'GRABFOOD', 'DELIVEROO',
+  // Ride-hailing via app — MCC 4121, app-based payment = online
+  'GRAB', 'GOJEK',
+  // E-commerce marketplaces — always online
+  'SHOPEE', 'LAZADA', 'AMAZON', 'ZALORA', 'QOO10',
+  // Digital subscriptions / streaming — always online
+  'NETFLIX', 'SPOTIFY', 'DISNEY', 'YOUTUBE', 'APPLE', 'GOOGLE',
+  'CHATGPT', 'CLAUDE', 'OPENAI', 'HULU'
+];
+
 // ── Citi Rewards: bonus blacklist (travel / mobile wallets) ──
 var CITI_EXCLUDE_KEYWORDS = [
   'AIRASIA', 'SCOOT', 'SINGAPORE AIR', 'SILKAIR', 'JETSTAR',
@@ -51,14 +70,20 @@ var CITI_EXCLUDE_KEYWORDS = [
 ];
 
 // ── HSBC Revolution: bonus whitelist ─────────────────────────
-// Grouped by MCC for easier maintenance.
-// Exclusions are checked first in calcHSBCReward(), so GRAB here
-// safely matches ride-hail while GRABFOOD is caught by the exclude list.
+// Earn rate: 10X (4 mpd) on eligible CONTACTLESS + ONLINE transactions.
+// History: contactless was cut to 1X in July 2024, then PERMANENTLY
+// RESTORED from 1 April 2026 (card upgraded Platinum → Visa Signature).
+// Cap: 9,000 Bonus Points per calendar month (~SGD1,000 eligible spend).
+// Source: HSBC website April 2026 + MileLion 16 Mar 2026 confirmation.
+//
+// Excluded MCCs (regardless of channel): fast food (5814), food delivery
+// (inconsistent MCC), OTAs, public transit (4111), insurance, utilities.
 var HSBC_BONUS_KEYWORDS = [
-  // MCC 5812 — Sit-down restaurants, cafes, hawker centres
+  // MCC 5812/5462 — Sit-down restaurants, cafes, bakeries, hawker centres
+  // Contactless tap now earns 4 mpd (restored April 2026)
   'RESTAURANT', 'CAFE', 'BAKERY', 'KOPITIAM', 'KOUFU', 'HAWKER',
 
-  // MCC 4121 — Ride-hailing (not food delivery — GRABFOOD is in exclude list)
+  // MCC 4121 — Ride-hailing (Grab/Gojek app = online transaction)
   'GRAB', 'GOJEK',
 
   // MCC 5311/5999 — Online retail / marketplaces
@@ -67,8 +92,10 @@ var HSBC_BONUS_KEYWORDS = [
   // MCC 7372/7375 — Digital subscriptions / streaming
   'NETFLIX', 'SPOTIFY', 'DISNEY', 'YOUTUBE', 'APPLE', 'GOOGLE ONE',
 
-  // MCC 3000–3999 / 7011 — Airlines and hotels (direct bookings only, not OTAs)
+  // MCC 3000–3999 / 4511 — Airlines (direct booking)
   'SINGAPORE AIR', 'SCOOT', 'AIRASIA', 'JETSTAR', 'CATHAY',
+
+  // MCC 3501–3999 / 7011 — Hotels (direct booking)
   'MARRIOTT', 'HILTON', 'HYATT', 'ACCOR', 'IHG'
 ];
 
@@ -107,13 +134,18 @@ var POSB_SPC_6PCT        = ['SPC'];
 // ─────────────────────────────────────────────────────────────
 function processEmails() {
   var label = getOrCreateLabel(PROCESSED_LABEL);
+  // Load the set of already-processed Gmail message IDs once.
+  // This is the source of truth for deduplication — replaces starring.
+  var processedIds = loadProcessedIds();
   var processed = 0;
 
-  processed += processCitiEmails(label);
-  processed += processPOSBPayNowEmails(label);
-  processed += processHSBCEmails(label);
-  processed += processPOSBEverydayEmails(label);
+  processed += processCitiEmails(label, processedIds);
+  processed += processPOSBPayNowEmails(label, processedIds);
+  processed += processHSBCEmails(label, processedIds);
+  processed += processPOSBEverydayEmails(label, processedIds);
 
+  // Persist any newly-added IDs back to storage
+  saveProcessedIds(processedIds);
   Logger.log('Total rows written: ' + processed);
 }
 
@@ -122,7 +154,7 @@ function processEmails() {
 // Subject: "Citi Alerts - Credit Card/Ready Credit Transaction"
 // Sender:  alerts@citibank.com.sg
 // ─────────────────────────────────────────────────────────────
-function processCitiEmails(label) {
+function processCitiEmails(label, processedIds) {
   // Search all Citi threads (including already-labelled ones) so we can
   // process new messages that arrived after the thread was first labelled.
   var query = 'from:alerts@citibank.com.sg subject:"Citi Alerts - Credit Card" after:2026/04/01';
@@ -137,8 +169,8 @@ function processCitiEmails(label) {
     for (var j = 0; j < messages.length; j++) {
       var msg = messages[j];
 
-      // Skip individual messages already processed (starred as sentinel)
-      if (msg.isStarred()) continue;
+      // Skip messages already processed in a previous run
+      if (processedIds[msg.getId()]) continue;
 
       // Normalise body: replace non-breaking spaces and collapse whitespace
       // around colons so regex works regardless of HTML-to-text rendering.
@@ -162,7 +194,7 @@ function processCitiEmails(label) {
         Logger.log('Citi: could not parse email — skipping. Subject: ' + msg.getSubject());
         // Log first 400 chars of normalised body to help diagnose format changes
         Logger.log('Body (first 400 chars): ' + body.substring(0, 400));
-        msg.star(); // mark as seen so we don't retry
+        processedIds[msg.getId()] = true; // mark as seen so we don't retry
         continue;
       }
 
@@ -197,9 +229,9 @@ function processCitiEmails(label) {
       var written = writeRow(row);
       if (!written) {
         Logger.log('Citi: write failed — will retry on next run. Detail: ' + rawDetail);
-        continue; // leave message unstarred so next run retries it
+        continue; // leave message untracked so next run retries it
       }
-      msg.star(); // mark this individual message as processed
+      processedIds[msg.getId()] = true; // mark this individual message as processed
       msg.markRead();
       count++;
       wroteAny = true;
@@ -217,7 +249,7 @@ function processCitiEmails(label) {
 // POSB PayNow PARSER
 // Sender: ibanking.alert@dbs.com  (subject contains "PayNow")
 // ─────────────────────────────────────────────────────────────
-function processPOSBPayNowEmails(label) {
+function processPOSBPayNowEmails(label, processedIds) {
   var query = 'from:ibanking.alert@dbs.com subject:PayNow after:2026/04/01';
   var threads = GmailApp.search(query);
   var count = 0;
@@ -230,7 +262,7 @@ function processPOSBPayNowEmails(label) {
     for (var j = 0; j < messages.length; j++) {
       var msg = messages[j];
 
-      if (msg.isStarred()) continue; // already processed
+      if (processedIds[msg.getId()]) continue; // already processed
 
       var body = msg.getPlainBody();
 
@@ -240,7 +272,7 @@ function processPOSBPayNowEmails(label) {
 
       if (!amtMatch) {
         Logger.log('POSB PayNow: could not parse amount — skipping.');
-        msg.star();
+        processedIds[msg.getId()] = true;
         continue;
       }
 
@@ -255,9 +287,9 @@ function processPOSBPayNowEmails(label) {
       var written = writeRow(row);
       if (!written) {
         Logger.log('POSB PayNow: write failed — will retry on next run. Recipient: ' + recipient);
-        continue; // leave message unstarred so next run retries it
+        continue; // leave message untracked so next run retries it
       }
-      msg.star();
+      processedIds[msg.getId()] = true;
       msg.markRead();
       count++;
       wroteAny = true;
@@ -277,7 +309,7 @@ function processPOSBPayNowEmails(label) {
 // Email is table-based HTML; plain text has label and value on
 // separate lines (no colon), so regex uses \s+ between them.
 // ─────────────────────────────────────────────────────────────
-function processHSBCEmails(label) {
+function processHSBCEmails(label, processedIds) {
   var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01';
   var threads = GmailApp.search(query);
   var count = 0;
@@ -289,24 +321,26 @@ function processHSBCEmails(label) {
 
     for (var j = 0; j < messages.length; j++) {
       var msg = messages[j];
-      if (msg.isStarred()) continue;
+      if (processedIds[msg.getId()]) continue;
 
       var rawBody = msg.getPlainBody();
       var body = rawBody
-        .replace(/\u00a0/g, ' ')
-        .replace(/\r\n/g, '\n');
+        .replace(/\u00a0/g, ' ')   // non-breaking space → regular space
+        .replace(/\r\n/g, '\n')    // CRLF → LF
+        .replace(/[ \t]{2,}/g, ' '); // collapse multiple spaces/tabs (table cell artefacts)
 
       var emailDate = msg.getDate();
 
-      // Fields are on their own lines, label then value (may have blank lines between)
-      var txnDateMatch = body.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Z]{3}\/\d{4})/i);
-      var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})([\d,]+\.?\d*)/i);
+      // Fields are on their own lines, label then value (may have blank lines between).
+      // \s* between currency code and digits handles "SGD 12.80" and "SGD12.80" variants.
+      var txnDateMatch = body.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Za-z]{3}\/\d{4})/i);
+      var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})\s*([\d,]+\.?\d*)/i);
       var descMatch    = body.match(/Description\s*:?\s+([^\n\r]+)/i);
 
       if (!txnAmtMatch || !descMatch) {
         Logger.log('HSBC: could not parse email — skipping. Subject: ' + msg.getSubject());
-        Logger.log('Body (first 500 chars): ' + body.substring(0, 500));
-        msg.star(); // prevent infinite retries
+        Logger.log('HSBC body (first 800 chars):\n' + body.substring(0, 800));
+        processedIds[msg.getId()] = true; // prevent infinite retries
         continue;
       }
 
@@ -327,7 +361,7 @@ function processHSBCEmails(label) {
         Logger.log('HSBC: write failed — will retry. Description: ' + context);
         continue;
       }
-      msg.star();
+      processedIds[msg.getId()] = true;
       msg.markRead();
       count++;
       wroteAny = true;
@@ -346,7 +380,7 @@ function processHSBCEmails(label) {
 // Sender:  ibanking.alert@dbs.com
 // Only processes transactions for card ending 9299.
 // ─────────────────────────────────────────────────────────────
-function processPOSBEverydayEmails(label) {
+function processPOSBEverydayEmails(label, processedIds) {
   var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" after:2026/04/01';
   var threads = GmailApp.search(query);
   var count = 0;
@@ -358,13 +392,13 @@ function processPOSBEverydayEmails(label) {
 
     for (var j = 0; j < messages.length; j++) {
       var msg = messages[j];
-      if (msg.isStarred()) continue;
+      if (processedIds[msg.getId()]) continue;
 
       var body = msg.getPlainBody().replace(/\u00a0/g, ' ').replace(/\r\n/g, '\n');
 
       // Only process transactions from card ending 9299
       if (body.indexOf('9299') === -1) {
-        msg.star(); // not our card — mark seen and skip
+        processedIds[msg.getId()] = true; // not our card — mark seen and skip
         continue;
       }
 
@@ -374,7 +408,7 @@ function processPOSBEverydayEmails(label) {
 
       if (!amtMatch) {
         Logger.log('POSB Everyday: could not parse amount — skipping.');
-        msg.star();
+        processedIds[msg.getId()] = true;
         continue;
       }
 
@@ -397,7 +431,7 @@ function processPOSBEverydayEmails(label) {
         Logger.log('POSB Everyday: write failed — will retry. Merchant: ' + context);
         continue;
       }
-      msg.star();
+      processedIds[msg.getId()] = true;
       msg.markRead();
       count++;
       wroteAny = true;
@@ -416,42 +450,61 @@ function processPOSBEverydayEmails(label) {
 
 function calcCitiReward(merchant, currency, amount, isAmaze) {
   var upper = merchant.toUpperCase();
+  // Miles rounded down to nearest SGD1 per T&C clause 13
+  var wholeAmt = Math.floor(amount);
 
-  // Check exclusions first
+  // Step 1: Hard exclusions (travel MCCs, mobile wallets) — always base rate
   for (var i = 0; i < CITI_EXCLUDE_KEYWORDS.length; i++) {
     if (upper.indexOf(CITI_EXCLUDE_KEYWORDS[i]) !== -1) {
-      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(amount * 0.4) };
+      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
     }
   }
 
-  // Non-SGD via Amaze still earns 4 mpd (non-travel)
-  var isFCY = (currency !== 'SGD');
-  var remarks4mpd = isFCY ? '4 mpd (FCY via Amaze)' : '4 mpd';
+  // Step 2: Via Amaze — Amaze re-codes any merchant as online MCC → 4 mpd
+  if (isAmaze) {
+    var isFCY = (currency !== 'SGD');
+    return {
+      bonusEligible: 'YES',
+      rate: isFCY ? '4 mpd (FCY via Amaze)' : '4 mpd (via Amaze)',
+      estReward: round2(wholeAmt * 4)
+    };
+  }
 
-  return {
-    bonusEligible: 'YES',
-    rate: remarks4mpd,
-    estReward: round2(amount * 4)
-  };
+  // Step 3: Confirmed-online merchants — earn 4 mpd (online retail per T&C)
+  for (var j = 0; j < CITI_ONLINE_KEYWORDS.length; j++) {
+    if (upper.indexOf(CITI_ONLINE_KEYWORDS[j]) !== -1) {
+      return { bonusEligible: 'YES', rate: '4 mpd (online)', estReward: round2(wholeAmt * 4) };
+    }
+  }
+
+  // Step 4: Everything else (physical dining, groceries, transport etc.) → base 0.4 mpd
+  // Citi 10X requires online channel or clothing/shoes/bags MCC — can't confirm from email alone
+  return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
 }
 
 function calcHSBCReward(merchant, currency, amount) {
   var upper = merchant.toUpperCase();
+  // Miles rounded down to nearest SGD1 per T&C clause 8
+  var wholeAmt = Math.floor(amount);
 
-  // Exclusions override bonus
+  // Step 1: Exclusions (fast food, food delivery, OTAs, transit) — always base rate
   for (var i = 0; i < HSBC_EXCLUDE_KEYWORDS.length; i++) {
     if (upper.indexOf(HSBC_EXCLUDE_KEYWORDS[i]) !== -1) {
-      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(amount * 0.4) };
+      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
     }
   }
 
+  // Step 2: Bonus-eligible merchants — earn 4 mpd
+  // Applies to both contactless and online transactions at eligible MCCs.
+  // Contactless restored from 1 April 2026 (was cut Jul 2024, now permanent).
   for (var j = 0; j < HSBC_BONUS_KEYWORDS.length; j++) {
     if (upper.indexOf(HSBC_BONUS_KEYWORDS[j]) !== -1) {
-      return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(amount * 4) };
+      return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(wholeAmt * 4) };
     }
   }
 
-  return { bonusEligible: '\u26a0\ufe0f', rate: '0.4 mpd', estReward: round2(amount * 0.4) };
+  // Step 3: Everything else — 0.4 mpd base (or contactless in-store)
+  return { bonusEligible: '\u26a0\ufe0f', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
 }
 
 function calcPOSBEverydayReward(merchant, currency, amount) {
@@ -569,6 +622,45 @@ function getOrCreateLabel(name) {
   var label = GmailApp.getUserLabelByName(name);
   if (!label) label = GmailApp.createLabel(name);
   return label;
+}
+
+/**
+ * Load the set of already-processed Gmail message IDs from Script Properties.
+ * Returns a plain object used as a hash set: { messageId: true, ... }
+ * This replaces the "star as sentinel" approach so that:
+ *   1. Stars remain free for the user's own bookmarking.
+ *   2. Threaded emails (multiple transactions in one thread) are correctly
+ *      deduplicated — each message ID is tracked individually.
+ */
+function loadProcessedIds() {
+  var raw = PropertiesService.getScriptProperties().getProperty('processedMsgIds');
+  if (!raw) return {};
+  try {
+    var arr = JSON.parse(raw);
+    var map = {};
+    for (var i = 0; i < arr.length; i++) map[arr[i]] = true;
+    return map;
+  } catch (e) {
+    Logger.log('loadProcessedIds: parse error, resetting. ' + e);
+    return {};
+  }
+}
+
+/**
+ * Persist the processed-ID set back to Script Properties.
+ * Keeps only the most recent 400 IDs to stay within the 9 KB property limit.
+ * Older IDs beyond this window are pruned — safe because emails that old
+ * would already have been labelled Bank-Processed and won't be written again.
+ */
+function saveProcessedIds(map) {
+  var arr = Object.keys(map);
+  // If over the cap, drop from the front (oldest additions first).
+  // Because we add to the set in order of processing, the front of the
+  // key list tends to be the oldest, but this is best-effort — the real
+  // guard against duplicates is the Bank-Processed label on the thread.
+  var MAX_IDS = 400;
+  if (arr.length > MAX_IDS) arr = arr.slice(arr.length - MAX_IDS);
+  PropertiesService.getScriptProperties().setProperty('processedMsgIds', JSON.stringify(arr));
 }
 
 // Parse "DD/MM/YY" (Citi format) → Date
@@ -778,6 +870,66 @@ function debugCitiBody() {
   Logger.log('detailMatch: ' + JSON.stringify(detailMatch));
 }
 
+/**
+ * Dumps the raw + normalised plain-text body of the most recent HSBC email
+ * and runs the three field regexes so you can see what matches or fails.
+ * Run this manually from the Apps Script editor, then check Logs.
+ */
+function debugHSBCBody() {
+  var threads = GmailApp.search(
+    'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01'
+  );
+  if (!threads.length) { Logger.log('HSBC: no threads found matching query.'); return; }
+
+  var msg = threads[0].getMessages()[0];
+  var raw = msg.getPlainBody();
+  var normalised = raw
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ');
+
+  Logger.log('=== RAW (first 800) ===\n' + raw.substring(0, 800));
+  Logger.log('=== NORMALISED (first 800) ===\n' + normalised.substring(0, 800));
+
+  var dateMatch = normalised.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Za-z]{3}\/\d{4})/i);
+  var amtMatch  = normalised.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})\s*([\d,]+\.?\d*)/i);
+  var descMatch = normalised.match(/Description\s*:?\s+([^\n\r]+)/i);
+
+  Logger.log('dateMatch: ' + JSON.stringify(dateMatch));
+  Logger.log('amtMatch:  ' + JSON.stringify(amtMatch));
+  Logger.log('descMatch: ' + JSON.stringify(descMatch));
+}
+
+/**
+ * Removes HSBC email message IDs from the processedIds store so the next
+ * processEmails() run will re-attempt any HSBC emails that previously
+ * failed to parse (e.g. due to the amount regex bug).
+ *
+ * Safe to run: only touches HSBC message IDs, leaves all others intact.
+ * Run this ONCE after deploying the regex fix, then run processEmails().
+ */
+function resetHSBCProcessedIds() {
+  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01';
+  var threads = GmailApp.search(query);
+  var processedIds = loadProcessedIds();
+  var removed = 0;
+
+  for (var i = 0; i < threads.length; i++) {
+    var messages = threads[i].getMessages();
+    for (var j = 0; j < messages.length; j++) {
+      var id = messages[j].getId();
+      if (processedIds[id]) {
+        delete processedIds[id];
+        removed++;
+      }
+    }
+  }
+
+  saveProcessedIds(processedIds);
+  Logger.log('resetHSBCProcessedIds: removed ' + removed + ' HSBC message IDs from processedIds.');
+  Logger.log('Now run processEmails() to reprocess them.');
+}
+
 /** Simulate parsing a real HSBC email body */
 function testHSBCParse() {
   var body = [
@@ -798,7 +950,7 @@ function testHSBCParse() {
   ].join('\n');
 
   var txnDateMatch = body.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Z]{3}\/\d{4})/i);
-  var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})([\d,]+\.?\d*)/i);
+  var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})\s*([\d,]+\.?\d*)/i);
   var descMatch    = body.match(/Description\s*:?\s+([^\n\r]+)/i);
 
   Logger.log('Date match: '   + (txnDateMatch ? txnDateMatch[1] : 'NONE'));
