@@ -341,6 +341,41 @@
       border-top: 0.5px solid var(--border);
       margin-top: 4px;
     }
+
+    /* ── Date group header (transactions) ── */
+    .date-group-header td {
+      background: var(--surface2) !important;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 5px 10px;
+      border-bottom: 0.5px solid var(--border);
+    }
+    .date-group-header:hover td { background: var(--surface2) !important; }
+
+    /* ── Month-over-month delta ── */
+    .delta { font-size: 11px; margin-top: 5px; }
+    .delta-up   { color: #E24B4A; }
+    .delta-down { color: #1D9E75; }
+    .delta-flat { color: var(--text3); }
+
+    /* ── Anomaly banner ── */
+    .anomaly-banner {
+      background: #FFF8ED;
+      border: 0.5px solid #F5A623;
+      border-radius: var(--radius-md);
+      padding: 10px 16px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: #7A4800;
+    }
+    @media (prefers-color-scheme: dark) {
+      .anomaly-banner { background: #2a1d00; border-color: #7a5200; color: #FAC775; }
+    }
+    .anomaly-banner strong { font-weight: 600; }
+    .anomaly-item { margin-top: 4px; font-size: 12px; color: inherit; opacity: 0.85; }
   </style>
 </head>
 <body>
@@ -469,6 +504,60 @@ function destroyChart(id) {
   if (charts[id]) { charts[id].destroy(); delete charts[id]; }
 }
 
+/* ── Extra formatters ── */
+function fmtFullDate(dt) {
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  return days[dt.getDay()] + ', ' + String(dt.getDate()).padStart(2,'0') + ' ' + MONTHS_SHORT[dt.getMonth()];
+}
+
+/* ── Previous month key ── */
+function getPrevMonthKey(key) {
+  const [m, y] = key.split('-');
+  const idx = MONTHS_SHORT.indexOf(m);
+  if (idx === 0) return MONTHS_SHORT[11] + '-' + (parseInt(y) - 1);
+  return MONTHS_SHORT[idx - 1] + '-' + y;
+}
+
+/* ── Anomaly detection ── */
+// Flags categories that are on pace to be >50% above their historical monthly average.
+// Requires at least 2 prior months of data to avoid false positives.
+function detectAnomalies(curTxns, allMonthKeys) {
+  const curKey = getCurrentMonthKey();
+  const priorKeys = allMonthKeys.filter(m => {
+    const [pm, py] = m.split('-');
+    const [cm, cy] = curKey.split('-');
+    return (parseInt(py) * 12 + MONTHS_SHORT.indexOf(pm)) <
+           (parseInt(cy) * 12 + MONTHS_SHORT.indexOf(cm));
+  });
+  if (priorKeys.length < 2) return [];
+
+  const now = new Date();
+  const dayOfMonth = now.getDate();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const anomalies = [];
+
+  Object.keys(BUDGET).forEach(cat => {
+    const curSpend = curTxns.filter(t => t.category === cat)
+      .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    if (curSpend < 10) return;
+
+    const histAmounts = priorKeys.map(k =>
+      allTxns.filter(t => getMonthKey(t.date) === k && t.category === cat)
+        .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0)
+    );
+    const histAvg = histAmounts.reduce((a, b) => a + b, 0) / histAmounts.length;
+    if (histAvg < 10) return;
+
+    const projected = (curSpend / dayOfMonth) * daysInMonth;
+    const pctOver = Math.round((projected / histAvg - 1) * 100);
+    if (pctOver > 50) {
+      anomalies.push({ cat, curSpend, projected, histAvg, pctOver });
+    }
+  });
+
+  return anomalies.sort((a, b) => b.pctOver - a.pctOver);
+}
+
 /* ── Overview ── */
 function renderOverview() {
   const curKey = getCurrentMonthKey();
@@ -481,9 +570,32 @@ function renderOverview() {
     .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
   const totalBudget = Object.values(BUDGET).reduce((a, b) => a + b, 0);
   const reviewCount = curTxns.filter(t => t.category === '⚠️ REVIEW').length;
-  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
   const dayOfMonth = new Date().getDate();
   const projectedSpend = (totalSpend / dayOfMonth) * daysInMonth;
+
+  // Daily burn rate (change 2)
+  const actualDailyRate = totalSpend / dayOfMonth;
+  const budgetDailyRate = totalBudget / daysInMonth;
+  const burnRatio = actualDailyRate / budgetDailyRate;
+  const burnColor = burnRatio >= 1.2 ? '#E24B4A' : burnRatio >= 1.0 ? '#EF9F27' : '#1D9E75';
+
+  // Month-over-month deltas (change 3)
+  const prevKey = getPrevMonthKey(curKey);
+  const prevSpend = allTxns
+    .filter(t => getMonthKey(t.date) === prevKey && t.category !== 'Big Ticket')
+    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  function momHtml(current, prev, label) {
+    if (!prev) return '';
+    const pct = Math.round((current - prev) / prev * 100);
+    const cls = pct > 0 ? 'delta-up' : pct < 0 ? 'delta-down' : 'delta-flat';
+    const arrow = pct > 0 ? '↑' : pct < 0 ? '↓' : '→';
+    return `<div class="delta ${cls}">${arrow} ${Math.abs(pct)}% vs ${label}</div>`;
+  }
+
+  // Anomaly detection (change 5)
+  const allMonthKeys = [...new Set(allTxns.map(t => getMonthKey(t.date)))];
+  const anomalies = detectAnomalies(curTxns, allMonthKeys);
 
   const catSpend = {};
   curTxns.forEach(t => {
@@ -498,11 +610,13 @@ function renderOverview() {
         <div class="metric-label">Month to date</div>
         <div class="metric-value">${fmtShort(totalSpend)}</div>
         <div class="metric-sub">of ${fmtShort(totalBudget)} budget</div>
+        ${momHtml(totalSpend, prevSpend, prevKey)}
       </div>
       <div class="metric">
         <div class="metric-label">Projected</div>
         <div class="metric-value">${fmtShort(projectedSpend)}</div>
         <div class="metric-sub">end of month estimate</div>
+        ${momHtml(projectedSpend, prevSpend, prevKey + ' actual')}
       </div>
       <div class="metric">
         <div class="metric-label">Transactions</div>
@@ -514,7 +628,18 @@ function renderOverview() {
         <div class="metric-value">${Math.round(totalSpend / totalBudget * 100)}%</div>
         <div class="metric-sub">${fmtShort(Math.max(0, totalBudget - totalSpend))} remaining</div>
       </div>
+      <div class="metric">
+        <div class="metric-label">Daily burn</div>
+        <div class="metric-value" style="color:${burnColor}">${fmtShort(actualDailyRate)}</div>
+        <div class="metric-sub">Budget pace ${fmtShort(budgetDailyRate)}/day</div>
+      </div>
     </div>
+
+    ${anomalies.length > 0 ? `
+    <div class="anomaly-banner">
+      <strong>Unusual spend detected</strong>
+      ${anomalies.map(a => `<div class="anomaly-item">· ${a.cat}: ${fmt(a.curSpend)} so far, tracking ${a.pctOver}% above your usual ${fmtShort(a.histAvg)}/mo</div>`).join('')}
+    </div>` : ''}
 
     ${reviewCount > 0 ? `
     <div class="review-banner">
@@ -818,7 +943,6 @@ function renderTransactions(selMonth, selCat, selCard) {
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>Date</th>
             <th>Context</th>
             <th style="text-align:right">Amount</th>
             <th>Category</th>
@@ -828,29 +952,46 @@ function renderTransactions(selMonth, selCat, selCard) {
             <th>Remarks</th>
           </tr></thead>
           <tbody>
-            ${txns.length === 0 ? `<tr><td colspan="8" style="text-align:center;padding:2rem;color:var(--text3)">No transactions found</td></tr>` :
-              txns.map(t => {
-                const elig = t.bonusEligible;
-                let eligBadge;
-                if (!elig)             eligBadge = `<span class="badge badge-na">—</span>`;
-                else if (elig==='YES') eligBadge = `<span class="badge badge-yes">Yes</span>`;
-                else if (elig==='NO')  eligBadge = `<span class="badge badge-no">No</span>`;
-                else                  eligBadge = `<span class="badge badge-chk">Check</span>`;
-
-                const catCol = CAT_COLORS[t.category] || '#888';
-                const fcyBadge = (t.currency && t.currency !== 'SGD')
-                  ? ` <span class="badge badge-fcy">${t.currency}</span>` : '';
-                return `<tr>
-                  <td style="color:var(--text2);white-space:nowrap;font-size:12px">${fmtDate(t.date)}</td>
-                  <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.context || '—'}</td>
-                  <td style="text-align:right;white-space:nowrap"><span style="font-weight:500;font-variant-numeric:tabular-nums">${fmt(t.amount)}</span>${fcyBadge}</td>
-                  <td><span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:${catCol}22;color:${catCol}">${t.category || '—'}</span></td>
-                  <td style="font-size:11px;color:var(--text2);white-space:nowrap">${t.card || '—'}</td>
-                  <td>${eligBadge}</td>
-                  <td style="font-size:11px;color:var(--text2)">${t.rewardRate || '—'}</td>
-                  <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.remarks || '').replace(/"/g, '&quot;')}">${t.remarks || '—'}</td>
-                </tr>`;
-              }).join('')}
+            ${txns.length === 0 ? `<tr><td colspan="7" style="text-align:center;padding:2rem;color:var(--text3)">No transactions found</td></tr>` :
+              (() => {
+                // Group by date
+                const groups = {};
+                txns.forEach(t => {
+                  const dt = parseDate(t.date);
+                  const iso = dt.getFullYear() + '-' + String(dt.getMonth()+1).padStart(2,'0') + '-' + String(dt.getDate()).padStart(2,'0');
+                  if (!groups[iso]) groups[iso] = { label: fmtFullDate(dt), txns: [], total: 0 };
+                  groups[iso].txns.push(t);
+                  groups[iso].total += parseFloat(t.amount) || 0;
+                });
+                return Object.keys(groups).sort((a,b) => b.localeCompare(a)).map(iso => {
+                  const g = groups[iso];
+                  const rows = g.txns.map(t => {
+                    const elig = t.bonusEligible;
+                    let eligBadge;
+                    if (!elig)             eligBadge = `<span class="badge badge-na">—</span>`;
+                    else if (elig==='YES') eligBadge = `<span class="badge badge-yes">Yes</span>`;
+                    else if (elig==='NO')  eligBadge = `<span class="badge badge-no">No</span>`;
+                    else                  eligBadge = `<span class="badge badge-chk">Check</span>`;
+                    const catCol = CAT_COLORS[t.category] || '#888';
+                    const fcyBadge = (t.currency && t.currency !== 'SGD')
+                      ? ` <span class="badge badge-fcy">${t.currency}</span>` : '';
+                    return `<tr>
+                      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.context || '—'}</td>
+                      <td style="text-align:right;white-space:nowrap"><span style="font-weight:500;font-variant-numeric:tabular-nums">${fmt(t.amount)}</span>${fcyBadge}</td>
+                      <td><span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:${catCol}22;color:${catCol}">${t.category || '—'}</span></td>
+                      <td style="font-size:11px;color:var(--text2);white-space:nowrap">${t.card || '—'}</td>
+                      <td>${eligBadge}</td>
+                      <td style="font-size:11px;color:var(--text2)">${t.rewardRate || '—'}</td>
+                      <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.remarks || '').replace(/"/g, '&quot;')}">${t.remarks || '—'}</td>
+                    </tr>`;
+                  }).join('');
+                  return `<tr class="date-group-header">
+                    <td colspan="2">${g.label}</td>
+                    <td style="text-align:right;font-variant-numeric:tabular-nums">${fmt(g.total)}</td>
+                    <td colspan="4"></td>
+                  </tr>${rows}`;
+                }).join('');
+              })()}
           </tbody>
         </table>
       </div>
@@ -914,6 +1055,7 @@ function renderTrends() {
       <div class="legend" id="trend-legend">
         <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Actual spend</div>
         <div class="legend-item"><div class="legend-dot" style="background:#E24B4A;border-radius:0;height:3px;width:16px;margin-top:3px"></div>Budget ${fmtShort(totalBudget)}/mo</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#EF9F27;border-radius:50%"></div>Expected pace (today)</div>
       </div>
       <div class="chart-wrap" style="height:260px">
         <canvas id="trendChart"></canvas>
@@ -933,6 +1075,12 @@ function renderTrends() {
   destroyChart('stack');
 
   const curKey = getCurrentMonthKey();
+  const now = new Date();
+  const dayOfMonth = now.getDate();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  // Pace dot: where budget-even-spend should be at today's date, only on current month
+  const paceData = months.map(m => m === curKey ? Math.round((totalBudget / daysInMonth) * dayOfMonth) : null);
+
   charts['trend'] = new Chart(document.getElementById('trendChart'), {
     type: 'bar',
     data: {
@@ -943,7 +1091,8 @@ function renderTrends() {
           data: totals,
           backgroundColor: months.map(m => m === curKey ? '#378ADD' : '#B5D4F4'),
           borderRadius: 4,
-          barPercentage: 0.7
+          barPercentage: 0.7,
+          order: 2
         },
         {
           label: 'Budget',
@@ -953,7 +1102,22 @@ function renderTrends() {
           borderWidth: 1.5,
           borderDash: [4, 4],
           pointRadius: 0,
-          fill: false
+          fill: false,
+          order: 1
+        },
+        {
+          label: 'Pace',
+          data: paceData,
+          type: 'line',
+          borderColor: '#EF9F27',
+          backgroundColor: '#EF9F27',
+          borderWidth: 0,
+          pointRadius: 7,
+          pointHoverRadius: 9,
+          pointStyle: 'circle',
+          fill: false,
+          spanGaps: false,
+          order: 0
         }
       ]
     },
@@ -962,7 +1126,10 @@ function renderTrends() {
       maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: ctx => ' ' + fmt(ctx.raw) } }
+        tooltip: { callbacks: { label: ctx => {
+          if (ctx.dataset.label === 'Pace') return ` Expected pace: ${fmt(ctx.raw)} (day ${dayOfMonth}/${daysInMonth})`;
+          return ' ' + fmt(ctx.raw);
+        }}}
       },
       scales: {
         x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
