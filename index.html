@@ -275,14 +275,30 @@
     .divider { border: none; border-top: 0.5px solid var(--border); margin: 14px 0; }
 
     /* ── Credit card image ── */
-    .cc-img-wrap { margin-bottom: 20px; }
+    .cc-img-wrap {
+      margin-bottom: 12px;
+      position: relative;
+      display: inline-block;
+    }
     .cc-img {
       display: block;
       width: 100%;
-      max-width: 260px;
+      max-width: 156px;
       height: auto;
-      border-radius: 12px;
-      box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+      border-radius: 8px;
+      box-shadow: 0 3px 12px rgba(0,0,0,0.18);
+    }
+    /* Cover the cardholder name — typically bottom-left of the card */
+    .cc-img-wrap::after {
+      content: '';
+      position: absolute;
+      bottom: 18%;
+      left: 6%;
+      width: 55%;
+      height: 10%;
+      background: rgba(0,0,0,0.55);
+      border-radius: 3px;
+      backdrop-filter: blur(4px);
     }
 
     /* ── Legend ── */

@@ -28,7 +28,7 @@ var CATEGORY_KEYWORDS = {
   'Food':          ['FAIRPRICE', 'NTUC', 'COLD STORAGE', 'SHENG SIONG', 'GIANT',
                     'MCDONALD', 'KFC', 'STARBUCKS', 'KOUFU', 'KOPITIAM',
                     'RESTAURANT', 'CAFE', 'BAKERY', 'HAWKER', 'FOODPANDA',
-                    'FOOD PANDA', 'FP*', 'DELIVEROO', 'GRABFOOD'],
+                    'FOOD PANDA', 'FP*', 'DELIVEROO', 'GRABFOOD', 'WINGSTOP'],
   'Transport':     ['GRAB', 'COMFORT', 'GOJEK', 'SIMPLYGO', 'BUS', 'MRT',
                     'LTA', 'TAXI', 'RYDE'],
   'Shopping':      ['LAZADA', 'SHOPEE', 'AMAZON', 'UNIQLO', 'ZARA', 'H&M',
@@ -51,19 +51,56 @@ var CITI_EXCLUDE_KEYWORDS = [
 ];
 
 // ── HSBC Revolution: bonus whitelist ─────────────────────────
+// Grouped by MCC for easier maintenance.
+// Exclusions are checked first in calcHSBCReward(), so GRAB here
+// safely matches ride-hail while GRABFOOD is caught by the exclude list.
 var HSBC_BONUS_KEYWORDS = [
+  // MCC 5812 — Sit-down restaurants, cafes, hawker centres
   'RESTAURANT', 'CAFE', 'BAKERY', 'KOPITIAM', 'KOUFU', 'HAWKER',
-  'GRAB', 'GOJEK', 'SHOPEE', 'LAZADA', 'AMAZON',
-  'NETFLIX', 'SPOTIFY', 'DISNEY', 'YOUTUBE',
-  'HOTEL', 'AIRLINE', 'SINGAPORE AIR', 'SCOOT', 'AIRASIA'
+
+  // MCC 4121 — Ride-hailing (not food delivery — GRABFOOD is in exclude list)
+  'GRAB', 'GOJEK',
+
+  // MCC 5311/5999 — Online retail / marketplaces
+  'SHOPEE', 'LAZADA', 'AMAZON', 'ZALORA', 'QOO10',
+
+  // MCC 7372/7375 — Digital subscriptions / streaming
+  'NETFLIX', 'SPOTIFY', 'DISNEY', 'YOUTUBE', 'APPLE', 'GOOGLE ONE',
+
+  // MCC 3000–3999 / 7011 — Airlines and hotels (direct bookings only, not OTAs)
+  'SINGAPORE AIR', 'SCOOT', 'AIRASIA', 'JETSTAR', 'CATHAY',
+  'MARRIOTT', 'HILTON', 'HYATT', 'ACCOR', 'IHG'
 ];
+
+// ── HSBC Revolution: exclusion list — these do NOT earn 4 mpd ─
 var HSBC_EXCLUDE_KEYWORDS = [
+  // MCC 5814 — Fast Food / Quick Service Restaurants
   'MCDONALD', 'KFC', 'BURGER KING', 'SUBWAY', 'POPEYES',
-  'STARBUCKS',   // MCC 5814 fast food
-  'DELIVEROO', 'FOODPANDA', 'FOOD PANDA', 'FP*',
+  'TEXAS CHICKEN', 'JOLLIBEE', 'WINGSTOP', '4FINGERS', 'FOUR FINGERS',
+  'SHAKE SHACK', 'FIVE GUYS', 'CARLS JR',
+  'STARBUCKS',          // Starbucks SG is inconsistently coded 5814/5812 — exclude to be safe
+
+  // Food delivery platforms — randomly coded 5812 or 5814; exclude to avoid over-claiming
+  'GRABFOOD', 'FOODPANDA', 'FOOD PANDA', 'FP*', 'DELIVEROO',
+
+  // MCC 4722/4723 — Online travel agencies (OTAs)
   'AGODA', 'BOOKING.COM', 'EXPEDIA', 'KLOOK',
-  'SIMPLYGO'     // MCC 4111
+
+  // MCC 4111 — Public transport
+  'SIMPLYGO'
 ];
+
+// ── POSB Everyday: tier keyword lists ────────────────────────
+// All bonus tiers below require $800/mo min spend (marked ⚠️)
+var POSB_DELIVERY_10PCT  = ['FOODPANDA', 'FOOD PANDA', 'FP*', 'DELIVEROO', 'GRABFOOD'];
+var POSB_TRANSIT_10PCT   = ['SIMPLYGO', 'BUS/MRT'];
+var POSB_DINING_5PCT     = ['RESTAURANT', 'CAFE', 'BAKERY', 'KOPITIAM', 'KOUFU', 'HAWKER'];
+var POSB_DINING_EXCL     = ['MCDONALD', 'KFC', 'BURGER KING', 'SUBWAY', 'POPEYES', 'STARBUCKS'];
+var POSB_SHOPPING_5PCT   = ['LAZADA', 'SHOPEE', 'AMAZON'];
+// No min spend required for these:
+var POSB_SHENGSIONG_5PCT = ['SHENG SIONG'];
+var POSB_WATSONS_3PCT    = ['WATSONS'];
+var POSB_SPC_6PCT        = ['SPC'];
 
 // ─────────────────────────────────────────────────────────────
 // MAIN TRIGGER — runs every 5 minutes
@@ -74,6 +111,8 @@ function processEmails() {
 
   processed += processCitiEmails(label);
   processed += processPOSBPayNowEmails(label);
+  processed += processHSBCEmails(label);
+  processed += processPOSBEverydayEmails(label);
 
   Logger.log('Total rows written: ' + processed);
 }
@@ -232,6 +271,146 @@ function processPOSBPayNowEmails(label) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// HSBC REVOLUTION PARSER
+// Subject: "Transaction Alerts (Credit Card)"
+// Sender:  HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk
+// Email is table-based HTML; plain text has label and value on
+// separate lines (no colon), so regex uses \s+ between them.
+// ─────────────────────────────────────────────────────────────
+function processHSBCEmails(label) {
+  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01';
+  var threads = GmailApp.search(query);
+  var count = 0;
+
+  for (var i = 0; i < threads.length; i++) {
+    var thread = threads[i];
+    var messages = thread.getMessages();
+    var wroteAny = false;
+
+    for (var j = 0; j < messages.length; j++) {
+      var msg = messages[j];
+      if (msg.isStarred()) continue;
+
+      var rawBody = msg.getPlainBody();
+      var body = rawBody
+        .replace(/\u00a0/g, ' ')
+        .replace(/\r\n/g, '\n');
+
+      var emailDate = msg.getDate();
+
+      // Fields are on their own lines, label then value (may have blank lines between)
+      var txnDateMatch = body.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Z]{3}\/\d{4})/i);
+      var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})([\d,]+\.?\d*)/i);
+      var descMatch    = body.match(/Description\s*:?\s+([^\n\r]+)/i);
+
+      if (!txnAmtMatch || !descMatch) {
+        Logger.log('HSBC: could not parse email — skipping. Subject: ' + msg.getSubject());
+        Logger.log('Body (first 500 chars): ' + body.substring(0, 500));
+        msg.star(); // prevent infinite retries
+        continue;
+      }
+
+      var txnDate  = txnDateMatch ? parseHSBCDate(txnDateMatch[1]) : emailDate;
+      var currency = txnAmtMatch[1].toUpperCase();
+      var amount   = parseFloat(txnAmtMatch[2].replace(/,/g, ''));
+      var context  = descMatch[1].replace(/\s+/g, ' ').trim();
+
+      var card     = 'HSBC Revolution';
+      var category = guessCategory(context);
+      var reward   = calcHSBCReward(context, currency, amount);
+
+      var row = buildRow(txnDate, amount, category, context, card, currency,
+                         reward.bonusEligible, reward.rate, reward.estReward, '');
+
+      var written = writeRow(row);
+      if (!written) {
+        Logger.log('HSBC: write failed — will retry. Description: ' + context);
+        continue;
+      }
+      msg.star();
+      msg.markRead();
+      count++;
+      wroteAny = true;
+    }
+
+    if (wroteAny) thread.addLabel(label);
+  }
+
+  Logger.log('HSBC: wrote ' + count + ' rows');
+  return count;
+}
+
+// ─────────────────────────────────────────────────────────────
+// POSB EVERYDAY CARD PARSER
+// Subject: "Card Transaction Alert"
+// Sender:  ibanking.alert@dbs.com
+// Only processes transactions for card ending 9299.
+// ─────────────────────────────────────────────────────────────
+function processPOSBEverydayEmails(label) {
+  var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" after:2026/04/01';
+  var threads = GmailApp.search(query);
+  var count = 0;
+
+  for (var i = 0; i < threads.length; i++) {
+    var thread = threads[i];
+    var messages = thread.getMessages();
+    var wroteAny = false;
+
+    for (var j = 0; j < messages.length; j++) {
+      var msg = messages[j];
+      if (msg.isStarred()) continue;
+
+      var body = msg.getPlainBody().replace(/\u00a0/g, ' ').replace(/\r\n/g, '\n');
+
+      // Only process transactions from card ending 9299
+      if (body.indexOf('9299') === -1) {
+        msg.star(); // not our card — mark seen and skip
+        continue;
+      }
+
+      var amtMatch  = body.match(/Amount\s*:\s*([A-Z]{3})([\d,]+\.?\d*)/i);
+      var toMatch   = body.match(/To\s*:\s*(.+)/i);
+      var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(.+)/i);
+
+      if (!amtMatch) {
+        Logger.log('POSB Everyday: could not parse amount — skipping.');
+        msg.star();
+        continue;
+      }
+
+      var currency = amtMatch[1].toUpperCase();
+      var amount   = parseFloat(amtMatch[2].replace(/,/g, ''));
+      var txnDate  = dateMatch ? parsePOSBCardDate(dateMatch[1]) : msg.getDate();
+
+      // Strip trailing 3-letter country code from merchant name (e.g. "BUS/MRT SINGAPORE SGP")
+      var rawMerchant = toMatch ? toMatch[1].trim() : 'Unknown';
+      var context     = rawMerchant.replace(/\s+[A-Z]{3}$/, '').trim();
+
+      var category = guessCategory(context);
+      var reward   = calcPOSBEverydayReward(context, currency, amount);
+
+      var row = buildRow(txnDate, amount, category, context, 'POSB Everyday', currency,
+                         reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
+
+      var written = writeRow(row);
+      if (!written) {
+        Logger.log('POSB Everyday: write failed — will retry. Merchant: ' + context);
+        continue;
+      }
+      msg.star();
+      msg.markRead();
+      count++;
+      wroteAny = true;
+    }
+
+    if (wroteAny) thread.addLabel(label);
+  }
+
+  Logger.log('POSB Everyday: wrote ' + count + ' rows');
+  return count;
+}
+
+// ─────────────────────────────────────────────────────────────
 // REWARD CALCULATORS
 // ─────────────────────────────────────────────────────────────
 
@@ -273,6 +452,76 @@ function calcHSBCReward(merchant, currency, amount) {
   }
 
   return { bonusEligible: '\u26a0\ufe0f', rate: '0.4 mpd', estReward: round2(amount * 0.4) };
+}
+
+function calcPOSBEverydayReward(merchant, currency, amount) {
+  var upper = merchant.toUpperCase();
+  var k, found;
+
+  // MYR in-store: 10% (needs $800 min spend)
+  if (currency === 'MYR') {
+    return { bonusEligible: '\u26a0\ufe0f', rate: '10% MYR', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
+  }
+
+  // Food delivery: 10% (needs $800 min spend)
+  for (k = 0; k < POSB_DELIVERY_10PCT.length; k++) {
+    if (upper.indexOf(POSB_DELIVERY_10PCT[k]) !== -1) {
+      return { bonusEligible: '\u26a0\ufe0f', rate: '10% delivery', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
+    }
+  }
+
+  // Transit (SimplyGo / BUS/MRT): 10% (needs $800 min spend)
+  for (k = 0; k < POSB_TRANSIT_10PCT.length; k++) {
+    if (upper.indexOf(POSB_TRANSIT_10PCT[k]) !== -1) {
+      return { bonusEligible: '\u26a0\ufe0f', rate: '10% transit', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
+    }
+  }
+
+  // Check fast food exclusion before dining bonus
+  found = false;
+  for (k = 0; k < POSB_DINING_EXCL.length; k++) {
+    if (upper.indexOf(POSB_DINING_EXCL[k]) !== -1) { found = true; break; }
+  }
+
+  // Dining 5% — excludes fast food (needs $800 min spend)
+  if (!found) {
+    for (k = 0; k < POSB_DINING_5PCT.length; k++) {
+      if (upper.indexOf(POSB_DINING_5PCT[k]) !== -1) {
+        return { bonusEligible: '\u26a0\ufe0f', rate: '5% dining', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
+      }
+    }
+  }
+
+  // Online shopping 5% (needs $800 min spend)
+  for (k = 0; k < POSB_SHOPPING_5PCT.length; k++) {
+    if (upper.indexOf(POSB_SHOPPING_5PCT[k]) !== -1) {
+      return { bonusEligible: '\u26a0\ufe0f', rate: '5% online', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
+    }
+  }
+
+  // Sheng Siong 5% — no min spend required
+  for (k = 0; k < POSB_SHENGSIONG_5PCT.length; k++) {
+    if (upper.indexOf(POSB_SHENGSIONG_5PCT[k]) !== -1) {
+      return { bonusEligible: 'YES', rate: '5% supermarket', estReward: round2(amount * 0.05), remark: '' };
+    }
+  }
+
+  // Watsons 3% — no min spend required
+  for (k = 0; k < POSB_WATSONS_3PCT.length; k++) {
+    if (upper.indexOf(POSB_WATSONS_3PCT[k]) !== -1) {
+      return { bonusEligible: 'YES', rate: '3% Watsons', estReward: round2(amount * 0.03), remark: '' };
+    }
+  }
+
+  // SPC 6% — no min spend required
+  for (k = 0; k < POSB_SPC_6PCT.length; k++) {
+    if (upper.indexOf(POSB_SPC_6PCT[k]) !== -1) {
+      return { bonusEligible: 'YES', rate: '6% fuel', estReward: round2(amount * 0.06), remark: '' };
+    }
+  }
+
+  // Base rate 0.3% — always applicable
+  return { bonusEligible: 'YES', rate: '0.3%', estReward: round2(amount * 0.003), remark: '' };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -331,9 +580,25 @@ function parseCitiDate(str) {
   return new Date(year, month, day);
 }
 
-// Parse "09 Apr 2026" (DBS format) → Date
+// Parse "09 Apr 2026" (DBS PayNow format) → Date
 function parseDBSDate(str) {
   return new Date(str);
+}
+
+// Parse "11/APR/2026" (HSBC format) → Date
+function parseHSBCDate(str) {
+  // new Date("11 APR 2026") is understood by V8
+  var parts = str.split('/');
+  if (parts.length !== 3) return new Date();
+  return new Date(parts[0] + ' ' + parts[1] + ' ' + parts[2]);
+}
+
+// Parse "11 APR 19:58 (SGT)" (POSB Everyday format) → Date
+// Extracts day and month only; uses current calendar year.
+function parsePOSBCardDate(str) {
+  var match = str.match(/(\d{1,2})\s+([A-Za-z]{3})/);
+  if (!match) return new Date();
+  return new Date(match[1] + ' ' + match[2] + ' ' + new Date().getFullYear());
 }
 
 // Format Date → "07/Apr/2026"
@@ -511,6 +776,107 @@ function debugCitiBody() {
   var detailMatch = normalised.match(/Transaction details\s*:[\s\n]*(.+)/i);
   Logger.log('amtMatch: '    + JSON.stringify(amtMatch));
   Logger.log('detailMatch: ' + JSON.stringify(detailMatch));
+}
+
+/** Simulate parsing a real HSBC email body */
+function testHSBCParse() {
+  var body = [
+    'Card Number',
+    'XXXX-XXXX-XXXX-6513',
+    '',
+    'Transaction Date',
+    '11/APR/2026',
+    '',
+    'Transaction Time',
+    '20:11:17',
+    '',
+    'Transaction Amount',
+    'SGD12.80',
+    '',
+    'Description',
+    'Wingstop Singapore'
+  ].join('\n');
+
+  var txnDateMatch = body.match(/Transaction\s+Date\s*:?\s+(\d{2}\/[A-Z]{3}\/\d{4})/i);
+  var txnAmtMatch  = body.match(/Transaction\s+Amount\s*:?\s+([A-Z]{3})([\d,]+\.?\d*)/i);
+  var descMatch    = body.match(/Description\s*:?\s+([^\n\r]+)/i);
+
+  Logger.log('Date match: '   + (txnDateMatch ? txnDateMatch[1] : 'NONE'));
+  Logger.log('Amount match: ' + (txnAmtMatch  ? txnAmtMatch[2]  : 'NONE'));
+  Logger.log('Currency: '     + (txnAmtMatch  ? txnAmtMatch[1]  : 'NONE'));
+  Logger.log('Desc match: '   + (descMatch    ? descMatch[1]    : 'NONE'));
+
+  if (txnAmtMatch && descMatch) {
+    var date     = txnDateMatch ? parseHSBCDate(txnDateMatch[1]) : new Date();
+    var currency = txnAmtMatch[1];
+    var amount   = parseFloat(txnAmtMatch[2]);
+    var context  = descMatch[1].replace(/\s+/g, ' ').trim();
+    var cat      = guessCategory(context);
+    var reward   = calcHSBCReward(context, currency, amount);
+
+    Logger.log('Parsed date: '    + formatDate(date));
+    Logger.log('Context: '        + context);
+    Logger.log('Category: '       + cat);
+    Logger.log('Bonus eligible: ' + reward.bonusEligible);
+    Logger.log('Reward rate: '    + reward.rate);
+    Logger.log('Est reward: '     + reward.estReward);
+
+    var row = buildRow(date, amount, cat, context, 'HSBC Revolution', currency,
+                       reward.bonusEligible, reward.rate, reward.estReward, '');
+    Logger.log('Row: ' + JSON.stringify(row));
+  }
+}
+
+/** Simulate parsing a real POSB Everyday card email body */
+function testPOSBEverydayParse() {
+  var body = [
+    'Card Transaction Alert',
+    'Transaction Ref: SP1300144800000000195806',
+    '',
+    'Dear Sir / Madam,',
+    '',
+    'Date & Time: 11 APR 19:58 (SGT)',
+    'Amount: SGD0.10',
+    'From: DBS/POSB card ending 9299',
+    'To: BUS/MRT SINGAPORE SGP'
+  ].join('\n');
+
+  // Guard: only process our card
+  if (body.indexOf('9299') === -1) {
+    Logger.log('POSB Everyday test: card 9299 not found — would skip');
+    return;
+  }
+
+  var amtMatch  = body.match(/Amount\s*:\s*([A-Z]{3})([\d,]+\.?\d*)/i);
+  var toMatch   = body.match(/To\s*:\s*(.+)/i);
+  var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(.+)/i);
+
+  Logger.log('Amount match: ' + (amtMatch  ? amtMatch[2]  : 'NONE'));
+  Logger.log('Currency: '     + (amtMatch  ? amtMatch[1]  : 'NONE'));
+  Logger.log('To match: '     + (toMatch   ? toMatch[1]   : 'NONE'));
+  Logger.log('Date match: '   + (dateMatch ? dateMatch[1] : 'NONE'));
+
+  if (amtMatch) {
+    var currency = amtMatch[1].toUpperCase();
+    var amount   = parseFloat(amtMatch[2]);
+    var txnDate  = dateMatch ? parsePOSBCardDate(dateMatch[1]) : new Date();
+    var rawMerch = toMatch ? toMatch[1].trim() : 'Unknown';
+    var context  = rawMerch.replace(/\s+[A-Z]{3}$/, '').trim();
+    var cat      = guessCategory(context);
+    var reward   = calcPOSBEverydayReward(context, currency, amount);
+
+    Logger.log('Parsed date: '    + formatDate(txnDate));
+    Logger.log('Context: '        + context);
+    Logger.log('Category: '       + cat);
+    Logger.log('Bonus eligible: ' + reward.bonusEligible);
+    Logger.log('Reward rate: '    + reward.rate);
+    Logger.log('Est reward: '     + reward.estReward);
+    Logger.log('Remark: '         + reward.remark);
+
+    var row = buildRow(txnDate, amount, cat, context, 'POSB Everyday', currency,
+                       reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
+    Logger.log('Row: ' + JSON.stringify(row));
+  }
 }
 
 /** Write a single test row to the sheet */
