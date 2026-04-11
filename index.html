@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Expense Tracker</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #f9f8f6;
+      --surface: #ffffff;
+      --surface2: #f3f2ef;
+      --border: rgba(0,0,0,0.1);
+      --border2: rgba(0,0,0,0.18);
+      --text: #1a1a18;
+      --text2: #6b6b67;
+      --text3: #9e9e9a;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      --radius-xl: 16px;
+      --font: 'DM Sans', system-ui, sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #141413;
+        --surface: #1e1e1c;
+        --surface2: #272725;
+        --border: rgba(255,255,255,0.1);
+        --border2: rgba(255,255,255,0.18);
+        --text: #f0efe9;
+        --text2: #9e9e9a;
+        --text3: #6b6b67;
+      }
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: var(--surface);
+      border-bottom: 0.5px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-brand {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+    .header-sub {
+      font-size: 12px;
+      color: var(--text3);
+      margin-top: 1px;
+    }
+    .header-right {
+      font-size: 12px;
+      color: var(--text3);
+    }
+
+    /* ── Nav ── */
+    .nav {
+      background: var(--surface);
+      border-bottom: 0.5px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      gap: 0;
+    }
+    .nav-btn {
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text2);
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      padding: 14px 16px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .nav-btn:hover { color: var(--text); }
+    .nav-btn.active { color: var(--text); border-bottom-color: var(--text); }
+
+    /* ── Layout ── */
+    .content { max-width: 960px; margin: 0 auto; padding: 24px 24px; }
+    .tab { display: none; }
+    .tab.active { display: block; animation: tabFadeIn 0.18s ease; }
+    @keyframes tabFadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* ── Metrics ── */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .metric {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 18px 20px;
+      transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .metric:hover { box-shadow: 0 2px 10px rgba(0,0,0,0.07); border-color: var(--border2); }
+    @media (prefers-color-scheme: dark) { .metric:hover { box-shadow: 0 2px 10px rgba(0,0,0,0.3); } }
+    .metric-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+    .metric-value { font-size: 30px; font-weight: 600; color: var(--text); letter-spacing: -0.04em; line-height: 1; }
+    .metric-sub { font-size: 11px; color: var(--text3); margin-top: 6px; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 16px;
+    }
+
+    /* ── Progress bars ── */
+    .prog-row { margin-bottom: 14px; }
+    .prog-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+    .prog-label { font-size: 13px; color: var(--text); }
+    .prog-vals { font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+    .prog-track { height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+    .prog-fill { height: 100%; border-radius: 3px; transition: width 0.7s cubic-bezier(0.4,0,0.2,1); }
+    .fill-ok   { background: #1D9E75; }
+    .fill-warn { background: #EF9F27; }
+    .fill-over { background: #E24B4A; }
+
+    /* ── Charts ── */
+    .chart-wrap { position: relative; width: 100%; }
+
+    /* ── Two col ── */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+
+    /* ── Review banner ── */
+    .review-banner {
+      background: #FAEEDA;
+      border: 0.5px solid #FAC775;
+      border-radius: var(--radius-md);
+      padding: 10px 16px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: #633806;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    @media (prefers-color-scheme: dark) {
+      .review-banner { background: #2d1f00; border-color: #6b4400; color: #FAC775; }
+    }
+    .review-btn {
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: var(--radius-md);
+      border: 0.5px solid #FAC775;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-family: var(--font);
+    }
+
+    /* ── Table ── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      font-size: 11px;
+      color: var(--text2);
+      font-weight: 500;
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 0.5px solid var(--border);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+    }
+    td {
+      padding: 9px 10px;
+      border-bottom: 0.5px solid var(--border);
+      color: var(--text);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--surface2); }
+
+    /* ── Badges ── */
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .badge-yes  { background: #d4edda; color: #0F6E56; }
+    .badge-no   { background: #f8d7da; color: #A32D2D; }
+    .badge-chk  { background: #fff3cd; color: #854F0B; }
+    .badge-na   { background: var(--surface2); color: var(--text3); }
+    .badge-fcy  { background: #EEF2FF; color: #3730A3; font-size: 10px; padding: 1px 6px; vertical-align: middle; }
+    @media (prefers-color-scheme: dark) {
+      .badge-yes { background: #0a3d2b; color: #5DCAA5; }
+      .badge-no  { background: #3d0a0a; color: #F09595; }
+      .badge-chk { background: #3d2a00; color: #FAC775; }
+      .badge-fcy { background: #1e1b4b; color: #A5B4FC; }
+    }
+
+    /* ── Filters ── */
+    .filter-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+    .filter-row select {
+      font-size: 13px;
+      padding: 7px 12px;
+      border-radius: var(--radius-md);
+      border: 0.5px solid var(--border2);
+      background: var(--surface);
+      color: var(--text);
+      font-family: var(--font);
+      cursor: pointer;
+    }
+    .filter-label { font-size: 12px; color: var(--text3); }
+
+    /* ── Cap cards ── */
+    .cap-card {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    .cap-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+    .cap-name { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 3px; }
+    .cap-type { font-size: 12px; color: var(--text3); }
+    .cap-reward { text-align: right; }
+    .cap-reward-val { font-size: 20px; font-weight: 600; color: var(--text); }
+    .cap-reward-label { font-size: 11px; color: var(--text3); margin-top: 2px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .tag {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      white-space: nowrap;
+    }
+    .tag-yes { background: #E1F5EE; color: #085041; }
+    .tag-no  { background: #FAECE7; color: #4A1B0C; }
+    @media (prefers-color-scheme: dark) {
+      .tag-yes { background: #04342C; color: #5DCAA5; }
+      .tag-no  { background: #2a0d05; color: #F0997B; }
+    }
+    .divider { border: none; border-top: 0.5px solid var(--border); margin: 14px 0; }
+
+    /* ── Credit card image ── */
+    .cc-img-wrap { margin-bottom: 20px; }
+    .cc-img {
+      display: block;
+      width: 100%;
+      max-width: 260px;
+      height: auto;
+      border-radius: 12px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+    }
+
+    /* ── Legend ── */
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; }
+    .legend-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text2); }
+    .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
+    /* ── Loading / Error ── */
+    .loading {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: var(--text3);
+      font-size: 14px;
+    }
+    .loading-spinner {
+      width: 24px; height: 24px;
+      border: 2px solid var(--border);
+      border-top-color: var(--text2);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-box {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 2rem;
+      text-align: center;
+      color: #A32D2D;
+      font-size: 13px;
+    }
+    .error-box p { margin-bottom: 8px; }
+
+    /* ── Totals row ── */
+    .totals-row {
+      font-size: 12px;
+      color: var(--text2);
+      padding: 10px 10px 0;
+      border-top: 0.5px solid var(--border);
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<header class="header">
+  <div>
+    <div class="header-brand">Expense Tracker</div>
+    <div class="header-sub">Connected to Expenses 2026</div>
+  </div>
+  <div class="header-right" id="last-updated">Loading...</div>
+</header>
+
+<nav class="nav">
+  <button class="nav-btn active" onclick="showTab('overview')">Overview</button>
+  <button class="nav-btn" onclick="showTab('cards')">Cards</button>
+  <button class="nav-btn" onclick="showTab('transactions')">Transactions</button>
+  <button class="nav-btn" onclick="showTab('trends')">Trends</button>
+</nav>
+
+<main class="content">
+  <div id="tab-overview" class="tab active">
+    <div class="loading"><div class="loading-spinner"></div>Fetching your data...</div>
+  </div>
+  <div id="tab-cards" class="tab">
+    <div class="loading"><div class="loading-spinner"></div>Loading...</div>
+  </div>
+  <div id="tab-transactions" class="tab">
+    <div class="loading"><div class="loading-spinner"></div>Loading...</div>
+  </div>
+  <div id="tab-trends" class="tab">
+    <div class="loading"><div class="loading-spinner"></div>Loading...</div>
+  </div>
+</main>
+
+<script>
+const API = 'https://script.google.com/macros/s/AKfycbwMEqQkbG56iJTPQ0QeZhcrMpkPscOQayyEdD79tJA48-QWCYUk2L91wKOWW_o8Cfwf/exec';
+
+const BUDGET = {
+  Food: 650, Entertainment: 280, Shopping: 230,
+  'Misc.': 150, Transport: 200, Subscriptions: 80
+};
+
+const CAT_COLORS = {
+  Food: '#1D9E75', Transport: '#378ADD', Shopping: '#7F77DD',
+  Entertainment: '#D85A30', 'Misc.': '#888780', Subscriptions: '#D4537E',
+  'Big Ticket': '#BA7517', '⚠️ REVIEW': '#EF9F27'
+};
+
+const CARD_COLORS = {
+  CitiRewards: '#185FA5', 'HSBC Revolution': '#3B6D11',
+  'POSB Everyday': '#993C1D', 'POSB Savings': '#5F5E5A',
+  'Citi Cash Back+': '#534AB7'
+};
+
+const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+let allTxns = [];
+let charts = {};
+let currentTab = 'overview';
+
+/* ── Formatters ── */
+function fmt(n) {
+  return '$' + Number(n).toLocaleString('en-SG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtShort(n) {
+  return '$' + Math.round(n).toLocaleString('en-SG');
+}
+function fmtDate(d) {
+  const dt = parseDate(d);
+  return String(dt.getDate()).padStart(2,'0') + ' ' + MONTHS_SHORT[dt.getMonth()];
+}
+
+/* ── Date parsing ── */
+function parseDate(d) {
+  if (!d) return new Date();
+  if (d instanceof Date) return d;
+  if (typeof d === 'string' && d.includes('T')) return new Date(d);
+  if (typeof d === 'string' && d.includes('/')) {
+    const p = d.split('/');
+    if (p.length === 3) {
+      const mon = isNaN(p[1]) ? MONTHS_SHORT.indexOf(p[1]) : parseInt(p[1]) - 1;
+      return new Date(parseInt(p[2]), mon, parseInt(p[0]));
+    }
+  }
+  return new Date(d);
+}
+
+function getMonthKey(d) {
+  const dt = parseDate(d);
+  return MONTHS_SHORT[dt.getMonth()] + '-' + dt.getFullYear();
+}
+
+function getCurrentMonthKey() {
+  const now = new Date();
+  return MONTHS_SHORT[now.getMonth()] + '-' + now.getFullYear();
+}
+
+function sortMonthKeys(keys) {
+  return [...keys].sort((a, b) => {
+    const [am, ay] = a.split('-');
+    const [bm, by] = b.split('-');
+    return (parseInt(ay) * 12 + MONTHS_SHORT.indexOf(am)) -
+           (parseInt(by) * 12 + MONTHS_SHORT.indexOf(bm));
+  });
+}
+
+/* ── Tab navigation ── */
+function showTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.nav-btn').forEach((b, i) => {
+    b.classList.toggle('active', ['overview','cards','transactions','trends'][i] === name);
+  });
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  renderTab(name);
+}
+
+function renderTab(name) {
+  if (name === 'overview') renderOverview();
+  else if (name === 'cards') renderCards();
+  else if (name === 'transactions') renderTransactions();
+  else if (name === 'trends') renderTrends();
+}
+
+function destroyChart(id) {
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+}
+
+/* ── Overview ── */
+function renderOverview() {
+  const curKey = getCurrentMonthKey();
+  const curTxns = allTxns.filter(t => getMonthKey(t.date) === curKey);
+  const totalSpend = curTxns
+    .filter(t => t.category !== 'Big Ticket')
+    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  const bigTicketSpend = curTxns
+    .filter(t => t.category === 'Big Ticket')
+    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  const totalBudget = Object.values(BUDGET).reduce((a, b) => a + b, 0);
+  const reviewCount = curTxns.filter(t => t.category === '⚠️ REVIEW').length;
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+  const dayOfMonth = new Date().getDate();
+  const projectedSpend = (totalSpend / dayOfMonth) * daysInMonth;
+
+  const catSpend = {};
+  curTxns.forEach(t => {
+    const c = t.category || 'Uncategorised';
+    catSpend[c] = (catSpend[c] || 0) + (parseFloat(t.amount) || 0);
+  });
+
+  const el = document.getElementById('tab-overview');
+  el.innerHTML = `
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">Month to date</div>
+        <div class="metric-value">${fmtShort(totalSpend)}</div>
+        <div class="metric-sub">of ${fmtShort(totalBudget)} budget</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Projected</div>
+        <div class="metric-value">${fmtShort(projectedSpend)}</div>
+        <div class="metric-sub">end of month estimate</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Transactions</div>
+        <div class="metric-value">${curTxns.length}</div>
+        <div class="metric-sub">in ${curKey}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Budget used</div>
+        <div class="metric-value">${Math.round(totalSpend / totalBudget * 100)}%</div>
+        <div class="metric-sub">${fmtShort(Math.max(0, totalBudget - totalSpend))} remaining</div>
+      </div>
+    </div>
+
+    ${reviewCount > 0 ? `
+    <div class="review-banner">
+      <span>⚠ ${reviewCount} transaction${reviewCount > 1 ? 's' : ''} need your review — update category in Google Sheet</span>
+      <button class="review-btn" onclick="showTab('transactions')">View</button>
+    </div>` : ''}
+
+    <div class="two-col">
+      <div class="card">
+        <div class="card-title">Spending vs budget — ${curKey}</div>
+        ${Object.entries(BUDGET).map(([cat, bud]) => {
+          const spent = catSpend[cat] || 0;
+          const pct = Math.min(100, Math.round(spent / bud * 100));
+          const cls = pct >= 100 ? 'fill-over' : pct >= 80 ? 'fill-warn' : 'fill-ok';
+          return `<div class="prog-row">
+            <div class="prog-header">
+              <span class="prog-label">${cat}</span>
+              <span class="prog-vals">${fmt(spent)} / ${fmt(bud)}</span>
+            </div>
+            <div class="prog-track"><div class="prog-fill ${cls}" style="width:${pct}%"></div></div>
+          </div>`;
+        }).join('')}
+        ${bigTicketSpend > 0 ? `
+        <div style="margin-top:14px;padding-top:14px;border-top:0.5px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+          <span style="font-size:13px;color:var(--text2)">Big Ticket <span style="font-size:11px;color:var(--text3)">(excluded from budget)</span></span>
+          <span style="font-size:13px;font-weight:500;color:#BA7517">${fmt(bigTicketSpend)}</span>
+        </div>` : ''}
+      </div>
+
+      <div class="card">
+        <div class="card-title">Category breakdown</div>
+        <div class="legend" id="cat-legend"></div>
+        <div class="chart-wrap" style="height:220px">
+          <canvas id="catChart"></canvas>
+        </div>
+      </div>
+    </div>
+  `;
+
+  destroyChart('cat');
+  const cats = Object.keys(catSpend).filter(c => catSpend[c] > 0 && c !== 'Big Ticket');
+  const vals = cats.map(c => catSpend[c]);
+  const cols = cats.map(c => CAT_COLORS[c] || '#888780');
+
+  document.getElementById('cat-legend').innerHTML = cats.map((c, i) =>
+    `<div class="legend-item"><div class="legend-dot" style="background:${cols[i]}"></div>${c} ${fmt(catSpend[c])}</div>`
+  ).join('');
+
+  charts['cat'] = new Chart(document.getElementById('catChart'), {
+    type: 'doughnut',
+    data: {
+      labels: cats,
+      datasets: [{
+        data: vals,
+        backgroundColor: cols,
+        borderWidth: 3,
+        borderColor: getComputedStyle(document.documentElement).getPropertyValue('--surface') || '#fff'
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ' ' + fmt(ctx.raw) } }
+      },
+      cutout: '62%'
+    }
+  });
+}
+
+/* ── Credit card image helper ── */
+function ccVisual(src, alt) {
+  return `<div class="cc-img-wrap"><img class="cc-img" src="${src}" alt="${alt}"></div>`;
+}
+
+/* ── Cards ── */
+function renderCards() {
+  const curKey = getCurrentMonthKey();
+  const curTxns = allTxns.filter(t => getMonthKey(t.date) === curKey);
+
+  function bonusSpend(card) {
+    return curTxns.filter(t => t.card === card && t.bonusEligible === 'YES')
+      .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  }
+  function estReward(card) {
+    return curTxns.filter(t => t.card === card)
+      .reduce((s, t) => s + (parseFloat(t.estReward) || 0), 0);
+  }
+
+  const posbTotal = curTxns
+    .filter(t => t.card === 'POSB Everyday' || t.card === 'POSB Savings')
+    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+
+  const now = new Date();
+  const citiStatementDay = 19;
+  const citiResetDate = now.getDate() <= citiStatementDay
+    ? new Date(now.getFullYear(), now.getMonth(), citiStatementDay)
+    : new Date(now.getFullYear(), now.getMonth() + 1, citiStatementDay);
+  const citiDaysLeft = Math.ceil((citiResetDate - now) / (1000 * 60 * 60 * 24));
+  const hsbcDaysLeft = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() - now.getDate();
+
+  function capBar(spent, cap, daysLeft, resetLabel) {
+    const pct = Math.min(100, Math.round(spent / cap * 100));
+    const cls = pct >= 100 ? 'fill-over' : pct >= 80 ? 'fill-warn' : 'fill-ok';
+    return `
+      <div class="prog-row">
+        <div class="prog-header">
+          <span class="prog-label" style="font-size:12px">Bonus spend this month</span>
+          <span class="prog-vals">${fmt(spent)} / ${fmt(cap)}</span>
+        </div>
+        <div class="prog-track"><div class="prog-fill ${cls}" style="width:${pct}%"></div></div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:4px">${fmt(cap - spent)} remaining · ${daysLeft} days to ${resetLabel}</div>
+    `;
+  }
+
+  const citiCbSpend = curTxns
+    .filter(t => t.card === 'Citi Cash Back+')
+    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  const citiCbReward = estReward('Citi Cash Back+');
+
+  document.getElementById('tab-cards').innerHTML = `
+    <div class="cap-card">
+      ${ccVisual('./images/citi-rewards.png', 'Citi Rewards card')}
+      <div class="cap-header">
+        <div>
+          <div class="cap-name">Citi Rewards</div>
+          <div class="cap-type">Miles card · 4 mpd bonus · Statement month cap · Resets 19th</div>
+        </div>
+        <div class="cap-reward">
+          <div class="cap-reward-val">${Math.round(estReward('CitiRewards')).toLocaleString()}</div>
+          <div class="cap-reward-label">est. miles this month</div>
+        </div>
+      </div>
+      ${capBar(bonusSpend('CitiRewards'), 1000, citiDaysLeft, 'statement date')}
+      <hr class="divider">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">What earns 4 mpd</div>
+      <div class="tags">
+        <span class="tag tag-yes">Online purchases (SGD)</span>
+        <span class="tag tag-yes">Amaze — overseas FCY</span>
+        <span class="tag tag-yes">Grab / Gojek</span>
+        <span class="tag tag-yes">Food delivery apps</span>
+        <span class="tag tag-yes">Shopee / Lazada / Amazon</span>
+        <span class="tag tag-no">✕ Hotels / Airlines direct</span>
+        <span class="tag tag-no">✕ Agoda / Klook / Expedia</span>
+        <span class="tag tag-no">✕ In-store without Amaze</span>
+      </div>
+    </div>
+
+    <div class="cap-card">
+      ${ccVisual('./images/citi-cashback.png', 'Citi Cash Back+ card')}
+      <div class="cap-header">
+        <div>
+          <div class="cap-name">Citi Cash Back+</div>
+          <div class="cap-type">Cashback card · 1.6% on all spend · No cap · No min spend</div>
+        </div>
+        <div class="cap-reward">
+          <div class="cap-reward-val">${fmt(citiCbReward)}</div>
+          <div class="cap-reward-label">est. cashback this month</div>
+        </div>
+      </div>
+      <div class="prog-row">
+        <div class="prog-header">
+          <span class="prog-label" style="font-size:12px">Total spend this month</span>
+          <span class="prog-vals">${fmt(citiCbSpend)}</span>
+        </div>
+      </div>
+      <hr class="divider">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">How it works</div>
+      <div class="tags">
+        <span class="tag tag-yes">1.6% on all eligible spend</span>
+        <span class="tag tag-yes">No minimum spend</span>
+        <span class="tag tag-yes">No monthly cap</span>
+        <span class="tag tag-no">✕ No bonus categories</span>
+        <span class="tag tag-no">✕ Insurance / govt payments</span>
+      </div>
+    </div>
+
+    <div class="cap-card">
+      ${ccVisual('./images/hsbc-revolution.png', 'HSBC Revolution card')}
+      <div class="cap-header">
+        <div>
+          <div class="cap-name">HSBC Revolution</div>
+          <div class="cap-type">Miles card · 4 mpd bonus · Calendar month cap · Permanent from 1 Apr 2026</div>
+        </div>
+        <div class="cap-reward">
+          <div class="cap-reward-val">${Math.round(estReward('HSBC Revolution')).toLocaleString()}</div>
+          <div class="cap-reward-label">est. miles this month</div>
+        </div>
+      </div>
+      ${capBar(bonusSpend('HSBC Revolution'), 1000, hsbcDaysLeft, 'month end')}
+      <hr class="divider">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">What earns 4 mpd</div>
+      <div class="tags">
+        <span class="tag tag-yes">Contactless (PayWave / Apple Pay)</span>
+        <span class="tag tag-yes">Online purchases</span>
+        <span class="tag tag-yes">Dining in-store (tap to pay)</span>
+        <span class="tag tag-yes">Airlines / Hotels direct</span>
+        <span class="tag tag-no">✕ Fast food (MCC 5814)</span>
+        <span class="tag tag-no">✕ Agoda / Klook / Expedia</span>
+        <span class="tag tag-no">✕ Insurance / Utilities</span>
+        <span class="tag tag-no">✕ SimplyGo / Transport</span>
+      </div>
+    </div>
+
+    <div class="cap-card">
+      ${ccVisual('./images/posb-everyday.png', 'POSB Everyday card')}
+      <div class="cap-header">
+        <div>
+          <div class="cap-name">POSB Everyday</div>
+          <div class="cap-type">Cashback card · Up to 10% · S$20/category cap · S$800 min spend</div>
+        </div>
+        <div class="cap-reward">
+          <div class="cap-reward-val">${fmt(estReward('POSB Everyday'))}</div>
+          <div class="cap-reward-label">est. cashback this month</div>
+        </div>
+      </div>
+      <div class="prog-row">
+        <div class="prog-header">
+          <span class="prog-label" style="font-size:12px">Min spend to unlock bonus tiers</span>
+          <span class="prog-vals">${fmt(posbTotal)} / $800.00</span>
+        </div>
+        <div class="prog-track">
+          <div class="prog-fill ${posbTotal >= 800 ? 'fill-ok' : posbTotal >= 600 ? 'fill-warn' : 'fill-over'}"
+               style="width:${Math.min(100, Math.round(posbTotal/800*100))}%"></div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:4px">
+        ${posbTotal >= 800
+          ? '✓ Minimum spend unlocked — all bonus tiers active'
+          : fmt(800 - posbTotal) + ' more needed to unlock bonus tiers'}
+      </div>
+      <hr class="divider">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:10px">Category rates</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;font-size:12px">
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>SPC Petrol</span><span><strong>6%</strong> <span style="color:var(--text3);font-size:11px">+ 15% instant</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>SimplyGo</span><span><strong>10%</strong> <span style="color:var(--text3);font-size:11px">*S$800</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>Food delivery</span><span><strong>10%</strong> <span style="color:var(--text3);font-size:11px">*S$800</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>Dining</span><span><strong>5%</strong> <span style="color:var(--text3);font-size:11px">*S$800</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>Sheng Siong</span><span><strong>5%</strong> <span style="color:var(--text3);font-size:11px">no min</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--surface2);border-radius:var(--radius-md)">
+          <span>Online shopping</span><span><strong>5%</strong> <span style="color:var(--text3);font-size:11px">*S$800</span></span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ── Transactions ── */
+function renderTransactions(selMonth, selCat, selCard) {
+  const months = sortMonthKeys([...new Set(allTxns.map(t => getMonthKey(t.date)))]).reverse();
+  const curKey = getCurrentMonthKey();
+  selMonth = selMonth || (months.includes(curKey) ? curKey : months[0]);
+  selCat   = selCat || 'all';
+  selCard  = selCard || 'all';
+
+  let txns = allTxns.filter(t => getMonthKey(t.date) === selMonth);
+  if (selCat !== 'all')  txns = txns.filter(t => t.category === selCat);
+  if (selCard !== 'all') txns = txns.filter(t => t.card === selCard);
+  txns.sort((a, b) => parseDate(b.date) - parseDate(a.date));
+
+  const reviewCount = txns.filter(t => t.category === '⚠️ REVIEW').length;
+  const cats  = [...new Set(allTxns.map(t => t.category).filter(Boolean))].sort();
+  const cards = [...new Set(allTxns.map(t => t.card).filter(Boolean))].sort();
+  const total = txns.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+
+  const el = document.getElementById('tab-transactions');
+  el.innerHTML = `
+    <div class="filter-row">
+      <span class="filter-label">Filter:</span>
+      <select id="f-month" onchange="refilter()">
+        ${months.map(m => `<option value="${m}" ${m===selMonth?'selected':''}>${m}</option>`).join('')}
+      </select>
+      <select id="f-cat" onchange="refilter()">
+        <option value="all">All categories</option>
+        ${cats.map(c => `<option value="${c}" ${c===selCat?'selected':''}>${c}</option>`).join('')}
+      </select>
+      <select id="f-card" onchange="refilter()">
+        <option value="all">All cards</option>
+        ${cards.map(c => `<option value="${c}" ${c===selCard?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+
+    ${reviewCount > 0 ? `
+    <div class="review-banner">
+      <span>⚠ ${reviewCount} transaction${reviewCount>1?'s need':' needs'} review — open Google Sheet to update</span>
+    </div>` : ''}
+
+    <div class="card" style="padding:0;overflow:hidden">
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Date</th>
+            <th>Context</th>
+            <th style="text-align:right">Amount</th>
+            <th>Category</th>
+            <th>Card</th>
+            <th>Eligible</th>
+            <th>Rate</th>
+            <th>Remarks</th>
+          </tr></thead>
+          <tbody>
+            ${txns.length === 0 ? `<tr><td colspan="8" style="text-align:center;padding:2rem;color:var(--text3)">No transactions found</td></tr>` :
+              txns.map(t => {
+                const elig = t.bonusEligible;
+                let eligBadge;
+                if (!elig)             eligBadge = `<span class="badge badge-na">—</span>`;
+                else if (elig==='YES') eligBadge = `<span class="badge badge-yes">Yes</span>`;
+                else if (elig==='NO')  eligBadge = `<span class="badge badge-no">No</span>`;
+                else                  eligBadge = `<span class="badge badge-chk">Check</span>`;
+
+                const catCol = CAT_COLORS[t.category] || '#888';
+                const fcyBadge = (t.currency && t.currency !== 'SGD')
+                  ? ` <span class="badge badge-fcy">${t.currency}</span>` : '';
+                return `<tr>
+                  <td style="color:var(--text2);white-space:nowrap;font-size:12px">${fmtDate(t.date)}</td>
+                  <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.context || '—'}</td>
+                  <td style="text-align:right;white-space:nowrap"><span style="font-weight:500;font-variant-numeric:tabular-nums">${fmt(t.amount)}</span>${fcyBadge}</td>
+                  <td><span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:${catCol}22;color:${catCol}">${t.category || '—'}</span></td>
+                  <td style="font-size:11px;color:var(--text2);white-space:nowrap">${t.card || '—'}</td>
+                  <td>${eligBadge}</td>
+                  <td style="font-size:11px;color:var(--text2)">${t.rewardRate || '—'}</td>
+                  <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.remarks || '').replace(/"/g, '&quot;')}">${t.remarks || '—'}</td>
+                </tr>`;
+              }).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="totals-row">${txns.length} transactions · Total: <strong>${fmt(total)}</strong></div>
+    </div>
+  `;
+}
+
+window.refilter = function() {
+  const m = document.getElementById('f-month')?.value;
+  const c = document.getElementById('f-cat')?.value;
+  const k = document.getElementById('f-card')?.value;
+  renderTransactions(m, c, k);
+};
+
+/* ── Trends ── */
+function renderTrends() {
+  const monthTotals = {};
+  const monthCats   = {};
+
+  allTxns.forEach(t => {
+    const mk  = getMonthKey(t.date);
+    const amt = parseFloat(t.amount) || 0;
+    monthTotals[mk] = (monthTotals[mk] || 0) + amt;
+    if (!monthCats[mk]) monthCats[mk] = {};
+    const cat = t.category || 'Other';
+    monthCats[mk][cat] = (monthCats[mk][cat] || 0) + amt;
+  });
+
+  const months     = sortMonthKeys(Object.keys(monthTotals));
+  const totals     = months.map(m => Math.round(monthTotals[m] || 0));
+  const totalBudget = Object.values(BUDGET).reduce((a, b) => a + b, 0);
+  const topCats    = Object.keys(CAT_COLORS).filter(c => c !== '⚠️ REVIEW');
+
+  const avgSpend = months.length > 0 ? Math.round(totals.reduce((a, b) => a + b, 0) / months.length) : 0;
+  const minIdx = totals.indexOf(Math.min(...totals));
+  const maxIdx = totals.indexOf(Math.max(...totals));
+
+  const el = document.getElementById('tab-trends');
+  el.innerHTML = `
+    <div class="metrics" style="margin-bottom:20px">
+      <div class="metric">
+        <div class="metric-label">Monthly avg</div>
+        <div class="metric-value">${fmtShort(avgSpend)}</div>
+        <div class="metric-sub">over ${months.length} month${months.length !== 1 ? 's' : ''}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Best month</div>
+        <div class="metric-value" style="color:#1D9E75">${fmtShort(totals[minIdx] || 0)}</div>
+        <div class="metric-sub">${months[minIdx] || '—'}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Worst month</div>
+        <div class="metric-value" style="color:#E24B4A">${fmtShort(totals[maxIdx] || 0)}</div>
+        <div class="metric-sub">${months[maxIdx] || '—'}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Monthly total spend</div>
+      <div class="legend" id="trend-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Actual spend</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#E24B4A;border-radius:0;height:3px;width:16px;margin-top:3px"></div>Budget ${fmtShort(totalBudget)}/mo</div>
+      </div>
+      <div class="chart-wrap" style="height:260px">
+        <canvas id="trendChart"></canvas>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">Category breakdown by month</div>
+      <div class="legend" id="cat-trend-legend"></div>
+      <div class="chart-wrap" style="height:${Math.max(300, months.length * 44 + 80)}px">
+        <canvas id="stackChart"></canvas>
+      </div>
+    </div>
+  `;
+
+  destroyChart('trend');
+  destroyChart('stack');
+
+  const curKey = getCurrentMonthKey();
+  charts['trend'] = new Chart(document.getElementById('trendChart'), {
+    type: 'bar',
+    data: {
+      labels: months,
+      datasets: [
+        {
+          label: 'Spend',
+          data: totals,
+          backgroundColor: months.map(m => m === curKey ? '#378ADD' : '#B5D4F4'),
+          borderRadius: 4,
+          barPercentage: 0.7
+        },
+        {
+          label: 'Budget',
+          data: months.map(() => totalBudget),
+          type: 'line',
+          borderColor: '#E24B4A',
+          borderWidth: 1.5,
+          borderDash: [4, 4],
+          pointRadius: 0,
+          fill: false
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ' ' + fmt(ctx.raw) } }
+      },
+      scales: {
+        x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+        y: { ticks: { callback: v => fmtShort(v) }, grid: { color: 'rgba(128,128,128,0.08)' } }
+      }
+    }
+  });
+
+  document.getElementById('cat-trend-legend').innerHTML = topCats.map(c =>
+    `<div class="legend-item"><div class="legend-dot" style="background:${CAT_COLORS[c]}"></div>${c}</div>`
+  ).join('');
+
+  charts['stack'] = new Chart(document.getElementById('stackChart'), {
+    type: 'bar',
+    data: {
+      labels: months,
+      datasets: topCats.map(cat => ({
+        label: cat,
+        data: months.map(m => Math.round(monthCats[m]?.[cat] || 0)),
+        backgroundColor: CAT_COLORS[cat],
+        borderRadius: 2,
+        barPercentage: 0.8
+      }))
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { mode: 'index', callbacks: { label: ctx => ` ${ctx.dataset.label}: ${fmt(ctx.raw)}` } }
+      },
+      scales: {
+        x: { stacked: true, ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+        y: { stacked: true, ticks: { callback: v => fmtShort(v) }, grid: { color: 'rgba(128,128,128,0.08)' } }
+      }
+    }
+  });
+}
+
+/* ── Load data ── */
+async function loadData() {
+  try {
+    const res  = await fetch(API);
+    const data = await res.json();
+
+    allTxns = (data.transactions || []).filter(t => {
+      const amt = parseFloat(t.amount);
+      return !isNaN(amt) && amt > 0;
+    });
+
+    const now = new Date();
+    document.getElementById('last-updated').textContent =
+      'Updated ' + now.toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' });
+
+    renderTab('overview');
+  } catch (e) {
+    document.getElementById('tab-overview').innerHTML = `
+      <div class="error-box">
+        <p>Could not load data from Google Sheets.</p>
+        <p style="color:var(--text2);margin-top:8px;font-size:12px">${e.message}</p>
+        <p style="color:var(--text3);margin-top:12px;font-size:11px">Make sure your Apps Script is deployed with access set to "Anyone"</p>
+      </div>`;
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>
