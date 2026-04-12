@@ -146,6 +146,43 @@ S$800/month minimum spend to unlock bonus tiers. Base rate 0.3%.
 ### POSB Savings — No rewards
 Category always `⚠️ REVIEW`. Used for PayNow transfers only.
 
+## Merchants Tab (Classification System)
+
+A `Merchants` tab in the same Google Sheet acts as a persistent lookup table. Apps Script checks it **before** falling back to keyword arrays.
+
+### Tab Columns (A–G)
+
+| Col | Header | Purpose |
+|-----|--------|---------|
+| A | Match Key | Uppercase substring to match against raw merchant name |
+| B | Display Name | Human-readable name (reference only) |
+| C | Category | Food / Transport / Shopping / Subscriptions / Entertainment / Misc |
+| D | HSBC Eligible | `YES` / `NO` / blank (blank = fall back to keyword logic) |
+| E | Citi Online | `YES` / `NO` / blank |
+| F | MCC Code | Optional reference |
+| G | Notes | Freetext |
+
+### Lookup Priority
+
+1. Merchants tab (`lookupMerchant`) — exact substring match on Match Key
+2. Hardcoded keyword arrays (`CATEGORY_KEYWORDS`, `HSBC_BONUS_KEYWORDS`, `CITI_ONLINE_KEYWORDS`)
+3. `⚠️ REVIEW` if nothing matches
+
+### Key Functions
+
+- `setupMerchantsTab()` — one-time setup: creates tab with headers, formatting, frozen row
+- `seedMerchantsTab()` — scans Transactions tab for auto-captured card transactions since 1 Apr 2026; writes placeholder rows for merchants not yet in the table (user fills in Category/Eligibility manually using [HeyMax](https://heymax.ai))
+- `testMerchantsTabWrite()` — writes and deletes a test row, logs PASS/FAIL
+- `lookupMerchant(name)` — returns first matching record or null
+- `addMerchantToTable(...)` — appends new row, skips duplicates, clears cache
+- `lookupMCCExplorer(name)` — calls MCC Explorer API; requires `MCC_EXPLORER_KEY` in Script Properties (500 req/month free tier at mccexplorer.com)
+
+### Auto-Capture Filter
+
+`seedMerchantsTab()` and `listUnknownMerchants()` only consider rows where Card is one of: `CitiRewards`, `HSBC Revolution`, `POSB Everyday`. Manual entries are excluded.
+
+---
+
 ## Category Keyword Map
 
 | Category | Keywords |

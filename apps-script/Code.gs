@@ -4,9 +4,14 @@
 // Tab:   Transactions
 // ============================================================
 
-var SHEET_ID = '1xuRQ51hOXCVVex7TUhQqPExkFFBN8uXQYpw_j8DzPGA';
-var TAB_NAME = 'Transactions';
+var SHEET_ID        = '1xuRQ51hOXCVVex7TUhQqPExkFFBN8uXQYpw_j8DzPGA';
+var TAB_NAME        = 'Transactions';
+var MERCHANTS_TAB   = 'Merchants';
 var PROCESSED_LABEL = 'Bank-Processed';
+
+// Module-level cache — loaded once per script execution, cleared when a new
+// merchant is added so the next lookup sees the updated table.
+var _merchantsCache = null;
 
 // ── Column indices (1-based) ──────────────────────────────────
 var COL = {
@@ -470,22 +475,30 @@ function calcCitiReward(merchant, currency, amount, isAmaze) {
     };
   }
 
-  // Step 3: Confirmed-online merchants — earn 4 mpd (online retail per T&C)
+  // Step 3: Merchants table — definitive YES/NO overrides keyword guessing
+  var record = lookupMerchant(merchant);
+  if (record && record.citiOnline === 'YES') {
+    return { bonusEligible: 'YES', rate: '4 mpd (online)', estReward: round2(wholeAmt * 4) };
+  }
+  if (record && record.citiOnline === 'NO') {
+    return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
+  }
+
+  // Step 4: Confirmed-online keyword fallback — earn 4 mpd (online retail per T&C)
   for (var j = 0; j < CITI_ONLINE_KEYWORDS.length; j++) {
     if (upper.indexOf(CITI_ONLINE_KEYWORDS[j]) !== -1) {
       return { bonusEligible: 'YES', rate: '4 mpd (online)', estReward: round2(wholeAmt * 4) };
     }
   }
 
-  // Step 4: Everything else (physical dining, groceries, transport etc.) → base 0.4 mpd
+  // Step 5: Everything else (physical dining, groceries, transport etc.) → base 0.4 mpd
   // Citi 10X requires online channel or clothing/shoes/bags MCC — can't confirm from email alone
   return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
 }
 
 function calcHSBCReward(merchant, currency, amount) {
-  var upper = merchant.toUpperCase();
-  // Miles rounded down to nearest SGD1 per T&C clause 8
-  var wholeAmt = Math.floor(amount);
+  var upper    = merchant.toUpperCase();
+  var wholeAmt = Math.floor(amount);  // miles rounded down to nearest SGD1 per T&C clause 8
 
   // Step 1: Exclusions (fast food, food delivery, OTAs, transit) — always base rate
   for (var i = 0; i < HSBC_EXCLUDE_KEYWORDS.length; i++) {
@@ -494,16 +507,23 @@ function calcHSBCReward(merchant, currency, amount) {
     }
   }
 
-  // Step 2: Bonus-eligible merchants — earn 4 mpd
-  // Applies to both contactless and online transactions at eligible MCCs.
-  // Contactless restored from 1 April 2026 (was cut Jul 2024, now permanent).
+  // Step 2: Merchants table — definitive YES/NO overrides keyword guessing
+  var record = lookupMerchant(merchant);
+  if (record && record.hsbcEligible === 'YES') {
+    return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(wholeAmt * 4) };
+  }
+  if (record && record.hsbcEligible === 'NO') {
+    return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
+  }
+
+  // Step 3: Bonus keyword fallback — earn 4 mpd (both contactless + online, restored Apr 2026)
   for (var j = 0; j < HSBC_BONUS_KEYWORDS.length; j++) {
     if (upper.indexOf(HSBC_BONUS_KEYWORDS[j]) !== -1) {
       return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(wholeAmt * 4) };
     }
   }
 
-  // Step 3: Everything else — 0.4 mpd base (or contactless in-store)
+  // Step 4: Everything else — 0.4 mpd base
   return { bonusEligible: '\u26a0\ufe0f', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
 }
 
@@ -578,10 +598,125 @@ function calcPOSBEverydayReward(merchant, currency, amount) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// MERCHANT TABLE — reads the Merchants sheet tab
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Load the Merchants tab into memory (cached for the lifetime of this
+ * script execution).  Each row becomes an object with keys:
+ *   matchKey, displayName, category, hsbcEligible, citiOnline, mcc, notes
+ */
+function getMerchantsTable() {
+  if (_merchantsCache) return _merchantsCache;
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(MERCHANTS_TAB);
+  if (!sheet) return (_merchantsCache = []);
+  var rows = sheet.getDataRange().getValues();
+  _merchantsCache = [];
+  for (var i = 1; i < rows.length; i++) {   // row 0 is the header
+    var key = rows[i][0];
+    if (!key || key.toString().trim() === '') continue;
+    _merchantsCache.push({
+      matchKey:     key.toString().toUpperCase().trim(),
+      displayName:  rows[i][1] ? rows[i][1].toString().trim() : '',
+      category:     rows[i][2] ? rows[i][2].toString().trim() : '',
+      hsbcEligible: rows[i][3] ? rows[i][3].toString().toUpperCase().trim() : '',
+      citiOnline:   rows[i][4] ? rows[i][4].toString().toUpperCase().trim() : '',
+      mcc:          rows[i][5] ? rows[i][5].toString().trim() : '',
+      notes:        rows[i][6] ? rows[i][6].toString().trim() : ''
+    });
+  }
+  Logger.log('Merchants table loaded: ' + _merchantsCache.length + ' entries');
+  return _merchantsCache;
+}
+
+/**
+ * Return the first Merchants row whose matchKey is a substring of
+ * the given merchant name (case-insensitive).  Returns null if not found.
+ */
+function lookupMerchant(merchantName) {
+  var upper   = merchantName.toUpperCase();
+  var records = getMerchantsTable();
+  for (var i = 0; i < records.length; i++) {
+    if (upper.indexOf(records[i].matchKey) !== -1) return records[i];
+  }
+  return null;
+}
+
+/**
+ * Call the MCC Explorer API to look up a merchant by name.
+ * Requires a free API key stored in Script Properties as 'MCC_EXPLORER_KEY'.
+ * Register at https://www.mccexplorer.com (500 requests/month free).
+ *
+ * Returns an object { mcc, category } or null if not found / not configured.
+ */
+function lookupMCCExplorer(merchantName) {
+  var key = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
+  if (!key) {
+    Logger.log('MCC Explorer: no API key set in Script Properties (MCC_EXPLORER_KEY) — skipping');
+    return null;
+  }
+  try {
+    var url = 'https://api.mccexplorer.com/lookup'
+            + '?name=' + encodeURIComponent(merchantName)
+            + '&key='  + encodeURIComponent(key);
+    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    var code     = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('MCC Explorer: HTTP ' + code + ' for "' + merchantName + '"');
+      return null;
+    }
+    var json = JSON.parse(response.getContentText());
+    // Expected shape: { mcc: "5812", category: "Food", ... }
+    // Adjust property names below if the actual API returns different keys.
+    if (!json || !json.mcc) return null;
+    Logger.log('MCC Explorer hit: "' + merchantName + '" → MCC ' + json.mcc);
+    return { mcc: json.mcc.toString(), category: json.category || '' };
+  } catch (e) {
+    Logger.log('MCC Explorer error for "' + merchantName + '": ' + e);
+    return null;
+  }
+}
+
+/**
+ * Append a new row to the Merchants tab and clear the in-memory cache
+ * so subsequent lookups within the same run see the new entry.
+ */
+function addMerchantToTable(matchKey, displayName, category, hsbcEligible, citiOnline, mcc, notes) {
+  // Skip if this merchant is already in the table — prevents duplicate rows
+  if (lookupMerchant(matchKey)) {
+    Logger.log('addMerchantToTable: "' + matchKey + '" already exists — skipping');
+    return;
+  }
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(MERCHANTS_TAB);
+  if (!sheet) {
+    Logger.log('addMerchantToTable: Merchants tab not found — skipping');
+    return;
+  }
+  sheet.appendRow([
+    matchKey.toUpperCase().trim(),
+    displayName,
+    category,
+    hsbcEligible,
+    citiOnline,
+    mcc,
+    notes
+  ]);
+  _merchantsCache = null;   // force reload on next lookup
+  Logger.log('Added to Merchants tab: ' + matchKey);
+}
+
+// ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
 
 function guessCategory(merchant) {
+  // 1. Check the Merchants table first — allows per-merchant overrides
+  var record = lookupMerchant(merchant);
+  if (record && record.category) return record.category;
+
+  // 2. Fall back to hardcoded keyword map
   var upper = merchant.toUpperCase();
   for (var cat in CATEGORY_KEYWORDS) {
     var keywords = CATEGORY_KEYWORDS[cat];
@@ -712,6 +847,192 @@ function formatMonthKey(date) {
 
 function round2(n) {
   return Math.round(n * 100) / 100;
+}
+
+// ─────────────────────────────────────────────────────────────
+// ONE-TIME SETUP — run manually from the Apps Script editor
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates the Merchants tab with headers if it doesn't already exist.
+ * Run once from the Apps Script editor: select setupMerchantsTab → Run.
+ */
+function setupMerchantsTab() {
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(MERCHANTS_TAB);
+
+  if (sheet) {
+    Logger.log('setupMerchantsTab: tab already exists — nothing to do');
+    return;
+  }
+
+  sheet = ss.insertSheet(MERCHANTS_TAB);
+  var headers = [
+    'Match Key',      // A — substring matched against raw merchant name (uppercase)
+    'Display Name',   // B — clean readable name (for your reference only)
+    'Category',       // C — Food / Transport / Shopping / Subscriptions / Entertainment / Misc
+    'HSBC Eligible',  // D — YES = 4 mpd | NO = 0.4 mpd | blank = fall back to keyword logic
+    'Citi Online',    // E — YES = 4 mpd online | NO = 0.4 mpd | blank = fall back to keyword logic
+    'MCC Code',       // F — optional, for reference (look up on heymax.ai)
+    'Notes'           // G — freetext
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  // Style the header row
+  var headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange.setFontWeight('bold');
+  headerRange.setBackground('#d9e1f2');
+
+  // Freeze header row
+  sheet.setFrozenRows(1);
+
+  // Set sensible column widths
+  sheet.setColumnWidth(1, 200);  // Match Key
+  sheet.setColumnWidth(2, 180);  // Display Name
+  sheet.setColumnWidth(3, 120);  // Category
+  sheet.setColumnWidth(4, 120);  // HSBC Eligible
+  sheet.setColumnWidth(5, 110);  // Citi Online
+  sheet.setColumnWidth(6, 90);   // MCC Code
+  sheet.setColumnWidth(7, 200);  // Notes
+
+  Logger.log('setupMerchantsTab: Merchants tab created successfully');
+  SpreadsheetApp.flush();
+}
+
+/**
+ * Write placeholder rows into the Merchants tab for every auto-captured merchant
+ * (from 1 Apr 2026) that is not yet classified.
+ *
+ * Run this once from the Apps Script editor to seed the Merchants tab.
+ * Each row will have the Match Key pre-filled and all other columns blank —
+ * open the sheet, look each one up on https://heymax.ai, then fill in
+ * Category, HSBC Eligible, Citi Online, and MCC Code.
+ *
+ * Safe to re-run: already-known merchants are skipped (no duplicates added).
+ */
+function seedMerchantsTab() {
+  var CUTOFF = new Date(2026, 3, 1);
+
+  var AUTO_CAPTURED_CARDS = {
+    'CitiRewards':     true,
+    'HSBC Revolution': true,
+    'POSB Everyday':   true,
+    'POSB Savings':    true
+  };
+
+  var ss       = SpreadsheetApp.openById(SHEET_ID);
+  var txnSheet = ss.getSheetByName(TAB_NAME);
+  var mchSheet = ss.getSheetByName(MERCHANTS_TAB);
+
+  if (!mchSheet) {
+    Logger.log('seedMerchantsTab: Merchants tab not found — run setupMerchantsTab() first');
+    return;
+  }
+
+  var txnRows   = txnSheet.getDataRange().getValues();
+  var merchants = getMerchantsTable();   // existing entries (for duplicate check)
+
+  var seen  = {};
+  var added = 0;
+
+  for (var i = 1; i < txnRows.length; i++) {
+    var card = txnRows[i][COL.CARD - 1] ? txnRows[i][COL.CARD - 1].toString().trim() : '';
+    if (!AUTO_CAPTURED_CARDS[card]) continue;
+
+    var rawDate = txnRows[i][COL.DATE - 1];
+    if (rawDate) {
+      var txnDate = new Date(rawDate.toString());
+      if (isNaN(txnDate.getTime()) || txnDate < CUTOFF) continue;
+    }
+
+    var ctx = txnRows[i][COL.CONTEXT - 1];
+    if (!ctx) continue;
+    var upper = ctx.toString().toUpperCase().trim();
+    if (seen[upper]) continue;
+    seen[upper] = true;
+
+    if (upper.indexOf('PAYNOW') !== -1) continue;   // PayNow always ⚠️ REVIEW by design
+
+    // Skip if already in the Merchants table
+    var alreadyKnown = false;
+    for (var j = 0; j < merchants.length; j++) {
+      if (upper.indexOf(merchants[j].matchKey) !== -1) { alreadyKnown = true; break; }
+    }
+    if (alreadyKnown) continue;
+
+    // Write a placeholder row — Match Key pre-filled, rest blank for you to complete
+    mchSheet.appendRow([upper, ctx.toString().trim(), '', '', '', '', 'Needs classification']);
+    added++;
+    Logger.log('Seeded: ' + upper);
+  }
+
+  _merchantsCache = null;   // clear cache after bulk insert
+  Logger.log('seedMerchantsTab: added ' + added + ' placeholder rows to the Merchants tab.');
+  Logger.log('Open the sheet, look each merchant up on https://heymax.ai, then fill in the blank columns.');
+  SpreadsheetApp.flush();
+}
+
+/**
+ * Helper: scan the Transactions tab for unique merchant names and list
+ * any that are not yet in the Merchants tab.  Run from the editor to see
+ * which merchants you should look up on heymax.ai and add to the table.
+ *
+ * NOTE: Output goes to the Execution Log in the Apps Script editor —
+ * click "Execution log" at the bottom of the screen after running.
+ * This function does NOT write to the sheet — use seedMerchantsTab() for that.
+ */
+function listUnknownMerchants() {
+  var CUTOFF = new Date(2026, 3, 1);  // 1 Apr 2026 — only consider transactions from this date
+
+  // Only rows written by the email parsers are relevant for the Merchants table.
+  // Manual entries in the sheet are excluded — they may have arbitrary merchants
+  // that don't reflect real card transactions.
+  var AUTO_CAPTURED_CARDS = {
+    'CitiRewards':    true,
+    'HSBC Revolution': true,
+    'POSB Everyday':  true,
+    'POSB Savings':   true   // PayNow — still auto-captured, though always ⚠️ REVIEW
+  };
+
+  var ss        = SpreadsheetApp.openById(SHEET_ID);
+  var txnSheet  = ss.getSheetByName(TAB_NAME);
+  var txnRows   = txnSheet.getDataRange().getValues();
+  var merchants = getMerchantsTable();
+
+  var seen    = {};
+  var unknown = [];
+
+  for (var i = 1; i < txnRows.length; i++) {
+    // Skip manual entries — only process rows captured by the email parsers
+    var card = txnRows[i][COL.CARD - 1] ? txnRows[i][COL.CARD - 1].toString().trim() : '';
+    if (!AUTO_CAPTURED_CARDS[card]) continue;
+
+    // Date is column B (index 1), stored as "DD/MMM/YYYY" e.g. "07/Apr/2026"
+    var rawDate = txnRows[i][COL.DATE - 1];
+    if (rawDate) {
+      var txnDate = new Date(rawDate.toString());
+      if (isNaN(txnDate.getTime()) || txnDate < CUTOFF) continue;
+    }
+
+    var ctx = txnRows[i][COL.CONTEXT - 1];
+    if (!ctx) continue;
+    var upper = ctx.toString().toUpperCase();
+    if (seen[upper]) continue;
+    seen[upper] = true;
+
+    // Skip PayNow entries — always ⚠️ REVIEW by design, no merchant to classify
+    if (upper.indexOf('PAYNOW') !== -1) continue;
+
+    var found = false;
+    for (var j = 0; j < merchants.length; j++) {
+      if (upper.indexOf(merchants[j].matchKey) !== -1) { found = true; break; }
+    }
+    if (!found) unknown.push(ctx.toString());
+  }
+
+  Logger.log('=== Merchants not yet in Merchants tab (' + unknown.length + ') — auto-captured, from 1 Apr 2026 ===');
+  unknown.forEach(function(m) { Logger.log('  ' + m); });
+  Logger.log('=== Look these up on https://heymax.ai then add to the Merchants tab ===');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1029,6 +1350,38 @@ function testPOSBEverydayParse() {
                        reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
     Logger.log('Row: ' + JSON.stringify(row));
   }
+}
+
+/**
+ * Write one test row to the Merchants tab, then immediately delete it.
+ * Run this to confirm the Merchants tab exists and is writable.
+ * Check the Execution Log after running — it will say PASS or FAIL.
+ */
+function testMerchantsTabWrite() {
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(MERCHANTS_TAB);
+
+  if (!sheet) {
+    Logger.log('FAIL: Merchants tab not found. Run setupMerchantsTab() first.');
+    return;
+  }
+
+  var beforeRows = sheet.getLastRow();
+  sheet.appendRow(['TEST_MERCHANT', 'Test Entry', 'Food', 'YES', 'NO', '5812', 'Auto-test — delete me']);
+  SpreadsheetApp.flush();
+  var afterRows = sheet.getLastRow();
+
+  if (afterRows === beforeRows + 1) {
+    Logger.log('PASS: Row written successfully to Merchants tab (row ' + afterRows + ').');
+    // Clean up the test row
+    sheet.deleteRow(afterRows);
+    SpreadsheetApp.flush();
+    Logger.log('PASS: Test row deleted. Merchants tab is working correctly.');
+  } else {
+    Logger.log('FAIL: Row count did not increase. Something went wrong.');
+  }
+
+  _merchantsCache = null;  // reset cache
 }
 
 /** Write a single test row to the sheet */
