@@ -1007,6 +1007,33 @@ function runBulkImport() {
     { matchKey: 'SOUP SPOON',   displayName: 'Soup Spoon',             category: 'Food', mcc: '5814' },
     { matchKey: 'STUFFD',       displayName: "Stuff'd",                category: 'Food', mcc: '5814' },
     { matchKey: 'PROJECT ACAI', displayName: 'Project Acai',           category: 'Food', mcc: '5814' },
+
+    // ── MCC 5814 — Bubble Tea ──
+    { matchKey: 'LIHO',         displayName: 'LiHO Tea',               category: 'Food', mcc: '5814' },
+    { matchKey: 'GONG CHA',     displayName: 'Gong Cha',               category: 'Food', mcc: '5814' },
+    { matchKey: 'TIGER SUGAR',  displayName: 'Tiger Sugar',            category: 'Food', mcc: '5814' },
+    { matchKey: 'KOI THE',      displayName: 'Koi Thé',                category: 'Food', mcc: '5814' },
+    { matchKey: 'KOI CAFE',     displayName: 'Koi Café',               category: 'Food', mcc: '5814' },
+    { matchKey: 'MR COCONUT',   displayName: 'Mr Coconut',             category: 'Food', mcc: '5814' },
+    { matchKey: 'CHATIME',      displayName: 'Chatime',                category: 'Food', mcc: '5814' },
+    { matchKey: 'COCO FRESH',   displayName: 'CoCo Fresh Tea & Juice', category: 'Food', mcc: '5814' },
+    { matchKey: 'COMEBUYTEA',   displayName: 'Comebuytea',             category: 'Food', mcc: '5814' },
+    { matchKey: 'R&B TEA',      displayName: 'R&B Tea',                category: 'Food', mcc: '5814' },
+    { matchKey: 'SUPER TEA',    displayName: 'Super Tea',              category: 'Food', mcc: '5814' },
+    { matchKey: 'BUBBLE NINI',  displayName: 'Bubble Nini',            category: 'Food', mcc: '5814' },
+
+    // ── MCC 5814 — Cafes ──
+    { matchKey: 'CRAFTSMEN',    displayName: 'Craftsmen Specialty Coffee', category: 'Food', mcc: '5814' },
+    { matchKey: 'DAYBREAK',     displayName: 'Daybreak Cafe',          category: 'Food', mcc: '5814' },
+    { matchKey: 'DEVON CAFE',   displayName: 'Devon Cafe',             category: 'Food', mcc: '5814' },
+    { matchKey: 'DUTCH SMUGGLER',displayName: 'Dutch Smuggler Coffee', category: 'Food', mcc: '5814' },
+    { matchKey: 'HAVEN SPECIALTY',displayName: 'Haven Specialty Coffee',category: 'Food', mcc: '5814' },
+    { matchKey: 'KILLINEY',     displayName: 'Killiney Kopitiam',      category: 'Food', mcc: '5814' },
+    { matchKey: 'MR TULK',      displayName: 'Mr Tulk Cafe',           category: 'Food', mcc: '5814' },
+    { matchKey: 'PABLO',        displayName: "Pablo & Rusty's",        category: 'Food', mcc: '5814' },
+    { matchKey: 'PAWA',         displayName: 'Pawa Cafe & Bar',        category: 'Food', mcc: '5814' },
+    { matchKey: 'MOS CAFE',     displayName: 'MOS Cafe',               category: 'Food', mcc: '5814' },
+    { matchKey: 'HANS',         displayName: 'Hans',                   category: 'Food', mcc: '5814' },
   ];
 
   var added = 0, skipped = 0;
