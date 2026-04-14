@@ -13,6 +13,7 @@ var PROCESSED_LABEL = 'Bank-Processed';
 // merchant is added so the next lookup sees the updated table.
 var _merchantsCache = null;
 
+
 // ── Column indices (1-based) ──────────────────────────────────
 var COL = {
   MONTH_KEY:     1,  // A
@@ -222,13 +223,15 @@ function processCitiEmails(label, processedIds) {
       context = context.replace(/\s+[A-Z]{3}$/, '').trim();
 
       var card     = 'CitiRewards';
+      autoRegisterMerchant(context);
+      var displayContext = resolveContext(context);
       var category = guessCategory(context);
       var remarks  = isAmaze ? 'Via Amaze' : '';
 
       // ── Reward calculation ──────────────────────────────
       var reward   = calcCitiReward(context, currency, amount, isAmaze);
 
-      var row = buildRow(txnDate, amount, category, context, card, currency,
+      var row = buildRow(txnDate, amount, category, displayContext, card, currency,
                          reward.bonusEligible, reward.rate, reward.estReward, remarks);
 
       var written = writeRow(row);
@@ -252,10 +255,12 @@ function processCitiEmails(label, processedIds) {
 
 // ─────────────────────────────────────────────────────────────
 // POSB PayNow PARSER
-// Sender: ibanking.alert@dbs.com  (subject contains "PayNow")
+// Sender: ibanking.alert@dbs.com
+// Subjects: "PayNow" OR "iBanking Alerts" (both used by DBS)
 // ─────────────────────────────────────────────────────────────
 function processPOSBPayNowEmails(label, processedIds) {
-  var query = 'from:ibanking.alert@dbs.com subject:PayNow after:2026/04/01';
+  // DBS sends PayNow confirmations under two subject lines — search both.
+  var query = 'from:ibanking.alert@dbs.com (subject:PayNow OR subject:"iBanking Alerts") after:2026/04/01';
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -271,9 +276,20 @@ function processPOSBPayNowEmails(label, processedIds) {
 
       var body = msg.getPlainBody();
 
-      var amtMatch  = body.match(/Amount\s*:\s*S?\$?([\d,]+\.?\d*)/i);
+      // Guard: only process emails that are actually PayNow confirmations.
+      // "iBanking Alerts" is a broad subject — this prevents accidentally
+      // capturing other DBS alert types that share the same subject line.
+      if (body.toUpperCase().indexOf('PAYNOW') === -1) {
+        Logger.log('POSB PayNow: email skipped — body does not mention PAYNOW. Subject: ' + msg.getSubject());
+        processedIds[msg.getId()] = true;
+        continue;
+      }
+
+      // Amount: handles both "SGD12.90" (iBanking Alerts format) and "S$12.90" (older format)
+      var amtMatch  = body.match(/Amount\s*:\s*(?:[A-Z]{3}|S\$|\$)?\s*([\d,]+\.?\d*)/i);
       var toMatch   = body.match(/To\s*:\s*(.+)/i);
-      var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(\d{2}\s+\w+\s+\d{4})/i);
+      // Date: handles "13 Apr 19:18 (SGT)" — captures day + 3-letter month, ignores time
+      var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(\d{1,2}\s+[A-Za-z]{3})/i);
 
       if (!amtMatch) {
         Logger.log('POSB PayNow: could not parse amount — skipping.');
@@ -355,10 +371,12 @@ function processHSBCEmails(label, processedIds) {
       var context  = descMatch[1].replace(/\s+/g, ' ').trim();
 
       var card     = 'HSBC Revolution';
+      autoRegisterMerchant(context);
+      var displayContext = resolveContext(context);
       var category = guessCategory(context);
       var reward   = calcHSBCReward(context, currency, amount);
 
-      var row = buildRow(txnDate, amount, category, context, card, currency,
+      var row = buildRow(txnDate, amount, category, displayContext, card, currency,
                          reward.bonusEligible, reward.rate, reward.estReward, '');
 
       var written = writeRow(row);
@@ -425,10 +443,12 @@ function processPOSBEverydayEmails(label, processedIds) {
       var rawMerchant = toMatch ? toMatch[1].trim() : 'Unknown';
       var context     = rawMerchant.replace(/\s+[A-Z]{3}$/, '').trim();
 
+      autoRegisterMerchant(context);
+      var displayContext = resolveContext(context);
       var category = guessCategory(context);
       var reward   = calcPOSBEverydayReward(context, currency, amount);
 
-      var row = buildRow(txnDate, amount, category, context, 'POSB Everyday', currency,
+      var row = buildRow(txnDate, amount, category, displayContext, 'POSB Everyday', currency,
                          reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
 
       var written = writeRow(row);
@@ -644,38 +664,131 @@ function lookupMerchant(merchantName) {
 }
 
 /**
- * Call the MCC Explorer API to look up a merchant by name.
- * Requires a free API key stored in Script Properties as 'MCC_EXPLORER_KEY'.
- * Register at https://www.mccexplorer.com (500 requests/month free).
+ * Looks up a merchant name using the MCC Explorer merchant lookup endpoint.
+ * Requires MCC Explorer Pro tier — free accounts receive HTTP 403 and the
+ * function returns null gracefully (new merchants are added with blank MCC
+ * fields and "Needs classification" note for manual review).
  *
- * Returns an object { mcc, category } or null if not found / not configured.
+ * If you upgrade to Pro, this works automatically with no code changes.
+ *
+ * Endpoint: GET https://mccexplorer.com/api/v2.1/lookup?merchant=<name>
+ * Auth:     x-api-key header
+ * Response: { data: { matches: [{ mcc_code, category, is_primary, confidence }] } }
+ *
+ * Returns { mcc, category } for the best match, or null.
  */
 function lookupMCCExplorer(merchantName) {
-  var key = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
-  if (!key) {
-    Logger.log('MCC Explorer: no API key set in Script Properties (MCC_EXPLORER_KEY) — skipping');
+  var apiKey = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
+  if (!apiKey) {
+    Logger.log('MCC Explorer: no API key set (MCC_EXPLORER_KEY) — skipping');
     return null;
   }
   try {
-    var url = 'https://api.mccexplorer.com/lookup'
-            + '?name=' + encodeURIComponent(merchantName)
-            + '&key='  + encodeURIComponent(key);
-    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-    var code     = response.getResponseCode();
+    var url = 'https://mccexplorer.com/api/v2.1/lookup'
+            + '?merchant=' + encodeURIComponent(merchantName);
+    var response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: { 'x-api-key': apiKey },
+      muteHttpExceptions: true
+    });
+    var code = response.getResponseCode();
+    if (code === 403) {
+      Logger.log('MCC Explorer: merchant lookup requires Pro tier — "' + merchantName + '" skipped');
+      return null;
+    }
     if (code !== 200) {
       Logger.log('MCC Explorer: HTTP ' + code + ' for "' + merchantName + '"');
       return null;
     }
     var json = JSON.parse(response.getContentText());
-    // Expected shape: { mcc: "5812", category: "Food", ... }
-    // Adjust property names below if the actual API returns different keys.
-    if (!json || !json.mcc) return null;
-    Logger.log('MCC Explorer hit: "' + merchantName + '" → MCC ' + json.mcc);
-    return { mcc: json.mcc.toString(), category: json.category || '' };
+    var matches = json.data && json.data.matches;
+    if (!matches || matches.length === 0) {
+      Logger.log('MCC Explorer: no matches for "' + merchantName + '"');
+      return null;
+    }
+    // Prefer a primary match; fall back to highest-confidence match
+    var best = null;
+    for (var i = 0; i < matches.length; i++) {
+      if (!best || (matches[i].is_primary && !best.is_primary)
+               || (matches[i].confidence > (best.confidence || 0))) {
+        best = matches[i];
+      }
+    }
+    Logger.log('MCC Explorer: "' + merchantName + '" → '
+             + best.merchant + ' MCC ' + best.mcc_code
+             + ' (confidence ' + best.confidence + ')');
+    return { mcc: best.mcc_code.toString(), category: best.category || '' };
   } catch (e) {
     Logger.log('MCC Explorer error for "' + merchantName + '": ' + e);
     return null;
   }
+}
+
+/**
+ * Test function — run from Apps Script editor to check the API key and
+ * merchant lookup endpoint.  Tries a few known Singapore merchants.
+ * Check the Execution Log for results.
+ *
+ * Note: 403 responses mean your account is on the Free tier (lookup is Pro+).
+ * 200 responses mean Pro is active and auto-classification will work.
+ */
+function testMCCExplorerAPI() {
+  var tests = ['Wingstop', 'McDonald', 'Grab', 'Netflix', 'Starbucks'];
+  for (var i = 0; i < tests.length; i++) {
+    var result = lookupMCCExplorer(tests[i]);
+    Logger.log(tests[i] + ' → ' + (result ? JSON.stringify(result) : 'no match / not on Pro tier'));
+  }
+}
+
+/**
+ * Maps an MCC code to HSBC Revolution bonus eligibility.
+ * Returns 'YES' (4 mpd), 'NO' (0.4 mpd), or '' (unknown — user reviews).
+ * Source: HSBC Revolution T&C + MileLion April 2026 confirmation.
+ */
+function mccToHsbcEligible(mcc) {
+  var n = parseInt(mcc, 10);
+  if (isNaN(n)) return '';
+
+  // Excluded — always 0.4 mpd
+  if (n === 5814)               return 'NO';  // Fast food / QSR
+  if (n === 4111 || n === 4131) return 'NO';  // Public transit / SimplyGo
+  if (n === 4722 || n === 4723) return 'NO';  // OTAs (Agoda, Booking.com etc.)
+
+  // Bonus eligible — 4 mpd (contactless + online, restored Apr 2026)
+  if (n === 5812 || n === 5811 || n === 5462) return 'YES'; // Restaurants / bakeries
+  if (n === 4121)               return 'YES'; // Taxicabs / ride-hailing
+  if (n === 4511)               return 'YES'; // Airlines (direct booking)
+  if (n === 7011)               return 'YES'; // Hotels (direct booking)
+  if (n === 5815)               return 'YES'; // Digital goods / streaming
+  if (n === 7372 || n === 7375) return 'YES'; // Software / subscriptions
+  if (n === 5311 || n === 5999) return 'YES'; // Department / retail stores
+  if (n >= 3000 && n <= 3350)   return 'YES'; // Airline MCCs (direct)
+  if (n >= 3501 && n <= 3999)   return 'YES'; // Hotel MCCs (direct)
+
+  return ''; // Unknown — user reviews
+}
+
+/**
+ * Maps an MCC code to Citi Rewards online eligibility.
+ * Travel MCCs are hard-excluded by T&C regardless of channel → 'NO'.
+ * All other MCCs return '' because the online/offline channel cannot be
+ * determined from the email alone — keyword arrays and user override handle it.
+ * Source: Citi Rewards 10X Promotion T&C, effective 1 April 2024.
+ */
+function mccToCitiOnline(mcc) {
+  var n = parseInt(mcc, 10);
+  if (isNaN(n)) return '';
+
+  // Citi hard exclusions — always 0.4 mpd regardless of channel
+  if (n === 4511)               return 'NO'; // Airlines
+  if (n === 7011)               return 'NO'; // Hotels
+  if (n === 7512)               return 'NO'; // Car rental
+  if (n === 4722 || n === 4723) return 'NO'; // OTAs
+  if (n >= 3000 && n <= 3350)   return 'NO'; // Airline MCCs
+  if (n >= 3351 && n <= 3500)   return 'NO'; // Car rental MCCs
+  if (n >= 3501 && n <= 3999)   return 'NO'; // Hotel MCCs
+
+  return ''; // Channel unknown — keyword list / user fills in
 }
 
 /**
@@ -725,6 +838,45 @@ function guessCategory(merchant) {
     }
   }
   return '\u26a0\ufe0f REVIEW';
+}
+
+/**
+ * Returns the display name to write into the Context column.
+ * Uses the Merchants table displayName when set; falls back to the raw email string.
+ */
+function resolveContext(rawMerchant) {
+  var record = lookupMerchant(rawMerchant);
+  if (record && record.displayName) return record.displayName;
+  return rawMerchant;
+}
+
+/**
+ * Registers a merchant in the Merchants table the first time it is seen.
+ * Calls MCC Explorer to pre-fill MCC and Category if an API key is configured.
+ * Safe to call on every transaction — skips silently if merchant already exists.
+ */
+function autoRegisterMerchant(rawMerchant) {
+  if (lookupMerchant(rawMerchant)) return; // already known
+
+  var mccResult    = lookupMCCExplorer(rawMerchant); // null if no API key set
+  var mcc          = mccResult ? mccResult.mcc      : '';
+  var category     = mccResult ? mccResult.category : '';
+  var hsbcEligible = mcc ? mccToHsbcEligible(mcc) : '';
+  var citiOnline   = mcc ? mccToCitiOnline(mcc)   : '';
+
+  // 'Review MCC XXXX' prompts user to confirm the auto-guess; 'Needs classification'
+  // means no MCC was found and both eligibility fields need to be filled manually.
+  var notes = mcc ? 'Review MCC ' + mcc : 'Needs classification';
+
+  addMerchantToTable(
+    rawMerchant,   // matchKey — uppercased inside addMerchantToTable()
+    '',            // displayName — user fills in
+    category,      // pre-filled by MCC Explorer if available
+    hsbcEligible,  // auto-determined from MCC if available
+    citiOnline,    // auto-determined from MCC if available
+    mcc,           // pre-filled by MCC Explorer if available
+    notes
+  );
 }
 
 /** Build an 11-element array matching column order A–K */
@@ -1350,6 +1502,96 @@ function testPOSBEverydayParse() {
                        reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
     Logger.log('Row: ' + JSON.stringify(row));
   }
+}
+
+/**
+ * Enriches Merchants tab rows where the user has manually filled in the MCC
+ * Code (column F) but left Category, HSBC Eligible, or Citi Online blank.
+ *
+ * Workflow:
+ *   1. A new merchant appears → auto-added to Merchants tab with "Needs classification"
+ *   2. You Google the merchant name + "MCC code" (e.g. "Wingstop MCC code" → 5814)
+ *   3. Type the MCC number into column F of that row
+ *   4. Run enrichMerchantsFromMCC() — this fills in Category, HSBC Eligible,
+ *      Citi Online automatically and updates the Notes column
+ *   5. All future transactions from that merchant use the correct reward rate
+ *
+ * Uses the free-tier MCC Explorer API to fetch the official category description.
+ * HSBC and Citi eligibility are determined from the T&C rules in mccToHsbcEligible()
+ * and mccToCitiOnline() — no Pro tier required for this function.
+ *
+ * Run from the Apps Script editor after filling in MCC codes in the sheet.
+ */
+function enrichMerchantsFromMCC() {
+  var apiKey = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
+  var ss     = SpreadsheetApp.openById(SHEET_ID);
+  var sheet  = ss.getSheetByName(MERCHANTS_TAB);
+  if (!sheet) {
+    Logger.log('enrichMerchantsFromMCC: Merchants tab not found');
+    return;
+  }
+
+  var rows    = sheet.getDataRange().getValues();
+  var updated = 0;
+
+  for (var i = 1; i < rows.length; i++) {  // skip header row
+    var mcc          = rows[i][5] ? rows[i][5].toString().trim() : '';
+    var category     = rows[i][2] ? rows[i][2].toString().trim() : '';
+    var hsbcEligible = rows[i][3] ? rows[i][3].toString().trim() : '';
+    var citiOnline   = rows[i][4] ? rows[i][4].toString().trim() : '';
+
+    // Only process rows that have an MCC but are missing at least one field
+    if (!mcc) continue;
+    if (category && hsbcEligible && citiOnline) continue; // already complete
+
+    // Determine eligibility from T&C rules (no API needed)
+    var newHsbc = hsbcEligible || mccToHsbcEligible(mcc);
+    var newCiti = citiOnline   || mccToCitiOnline(mcc);
+
+    // Fetch official category description from free-tier API (optional — skipped if no key)
+    var newCategory = category;
+    if (!newCategory && apiKey) {
+      try {
+        var url = 'https://mccexplorer.com/api/v2.1/mcc-codes/' + encodeURIComponent(mcc);
+        var resp = UrlFetchApp.fetch(url, {
+          method: 'get',
+          headers: { 'x-api-key': apiKey },
+          muteHttpExceptions: true
+        });
+        if (resp.getResponseCode() === 200) {
+          var json = JSON.parse(resp.getContentText());
+          if (json.data && json.data.category) {
+            newCategory = json.data.category;
+          }
+        }
+      } catch (e) {
+        Logger.log('enrichMerchantsFromMCC: API error for MCC ' + mcc + ': ' + e);
+      }
+    }
+
+    // Build a human-readable note
+    var eligSummary = [];
+    if (newHsbc === 'YES') eligSummary.push('HSBC 4mpd');
+    else if (newHsbc === 'NO') eligSummary.push('HSBC 0.4mpd');
+    if (newCiti === 'NO') eligSummary.push('Citi excluded');
+    var newNotes = 'MCC ' + mcc + (eligSummary.length ? ' — ' + eligSummary.join(', ') : ' — verify eligibility');
+
+    // Write back only the columns that changed (rowIndex is 1-based, +1 for header)
+    var rowNum = i + 1;
+    if (newCategory     && newCategory     !== category)     sheet.getRange(rowNum, 3).setValue(newCategory);
+    if (newHsbc                            !== hsbcEligible) sheet.getRange(rowNum, 4).setValue(newHsbc);
+    if (newCiti                            !== citiOnline)   sheet.getRange(rowNum, 5).setValue(newCiti);
+    sheet.getRange(rowNum, 7).setValue(newNotes);
+
+    Logger.log('Enriched row ' + rowNum + ': matchKey=' + rows[i][0]
+             + ' MCC=' + mcc + ' category=' + newCategory
+             + ' HSBC=' + newHsbc + ' Citi=' + newCiti);
+    updated++;
+  }
+
+  _merchantsCache = null;  // clear cache so next lookups see the updated data
+  SpreadsheetApp.flush();
+  Logger.log('enrichMerchantsFromMCC: updated ' + updated + ' rows');
 }
 
 /**
