@@ -664,79 +664,155 @@ function lookupMerchant(merchantName) {
 }
 
 /**
- * Looks up a merchant name using the MCC Explorer merchant lookup endpoint.
- * Requires MCC Explorer Pro tier — free accounts receive HTTP 403 and the
- * function returns null gracefully (new merchants are added with blank MCC
- * fields and "Needs classification" note for manual review).
+ * Fetches all MCC codes from MCC Explorer and builds a flat merchant-name →
+ * {mcc, category} lookup map.  The full database is fetched once per script
+ * execution (module-level cache) and also stored in CacheService for 6 hours
+ * so subsequent trigger runs don't hit the API unnecessarily.
  *
- * If you upgrade to Pro, this works automatically with no code changes.
+ * Returns the map object, or null if no API key / fetch failed.
  *
- * Endpoint: GET https://mccexplorer.com/api/v2.1/lookup?merchant=<name>
- * Auth:     x-api-key header
- * Response: { data: { matches: [{ mcc_code, category, is_primary, confidence }] } }
- *
- * Returns { mcc, category } for the best match, or null.
+ * NOTE: If the base URL below returns a 404, check your MCC Explorer dashboard
+ * for the correct API base URL and update the constant here.
  */
-function lookupMCCExplorer(merchantName) {
+var MCC_API_BASE = 'https://www.mccexplorer.com';
+
+function fetchMCCDatabase() {
+  // 1. In-memory cache (same execution)
+  if (_mccDatabase !== null) return _mccDatabase;
+
   var apiKey = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
-  if (!apiKey) {
-    Logger.log('MCC Explorer: no API key set (MCC_EXPLORER_KEY) — skipping');
-    return null;
+  if (!apiKey) return null;
+
+  // 2. CacheService (cross-execution, 6-hour TTL)
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get('mcc_merchant_map');
+  if (cached) {
+    try {
+      _mccDatabase = JSON.parse(cached);
+      Logger.log('MCC database loaded from cache ('
+               + Object.keys(_mccDatabase).length + ' merchant entries)');
+      return _mccDatabase;
+    } catch (e) { /* corrupt cache — fall through to re-fetch */ }
   }
+
+  // 3. Fetch from API
+  Logger.log('Fetching MCC database from API...');
   try {
-    var url = 'https://mccexplorer.com/api/v2.1/lookup'
-            + '?merchant=' + encodeURIComponent(merchantName);
-    var response = UrlFetchApp.fetch(url, {
+    var response = UrlFetchApp.fetch(MCC_API_BASE + '/api/v2.1/mcc-codes', {
       method: 'get',
       headers: { 'x-api-key': apiKey },
       muteHttpExceptions: true
     });
-    var code = response.getResponseCode();
-    if (code === 403) {
-      Logger.log('MCC Explorer: merchant lookup requires Pro tier — "' + merchantName + '" skipped');
+    if (response.getResponseCode() !== 200) {
+      Logger.log('MCC API error: HTTP ' + response.getResponseCode()
+               + ' — ' + response.getContentText().substring(0, 200));
       return null;
     }
-    if (code !== 200) {
-      Logger.log('MCC Explorer: HTTP ' + code + ' for "' + merchantName + '"');
+
+    var raw = JSON.parse(response.getContentText());
+    if (!Array.isArray(raw) || raw.length === 0) {
+      // Log the raw shape so we can adjust field names if needed
+      Logger.log('MCC API unexpected response shape: '
+               + JSON.stringify(raw).substring(0, 400));
       return null;
     }
-    var json = JSON.parse(response.getContentText());
-    var matches = json.data && json.data.matches;
-    if (!matches || matches.length === 0) {
-      Logger.log('MCC Explorer: no matches for "' + merchantName + '"');
-      return null;
-    }
-    // Prefer a primary match; fall back to highest-confidence match
-    var best = null;
-    for (var i = 0; i < matches.length; i++) {
-      if (!best || (matches[i].is_primary && !best.is_primary)
-               || (matches[i].confidence > (best.confidence || 0))) {
-        best = matches[i];
+
+    Logger.log('MCC API: received ' + raw.length + ' code entries. '
+             + 'First entry: ' + JSON.stringify(raw[0]).substring(0, 300));
+
+    // Flatten: for each MCC entry → each merchant name → {mcc, category}
+    // Field name fallbacks handle variation between API versions.
+    var map = {};
+    for (var i = 0; i < raw.length; i++) {
+      var entry    = raw[i];
+      var mcc      = (entry.mcc || entry.code || '').toString().trim();
+      var category = (entry.category || entry.edited_description
+                    || entry.combined_description || '').toString().trim();
+      var merchants = entry.merchants || [];
+      for (var j = 0; j < merchants.length; j++) {
+        var name = merchants[j].toString().toUpperCase().trim();
+        if (name.length >= 4 && mcc) {
+          map[name] = { mcc: mcc, category: category };
+        }
       }
     }
-    Logger.log('MCC Explorer: "' + merchantName + '" → '
-             + best.merchant + ' MCC ' + best.mcc_code
-             + ' (confidence ' + best.confidence + ')');
-    return { mcc: best.mcc_code.toString(), category: best.category || '' };
+
+    _mccDatabase = map;
+    Logger.log('MCC merchant map built: ' + Object.keys(map).length + ' entries');
+
+    // Cache if it fits within CacheService's 100 KB per-key limit
+    try {
+      var json = JSON.stringify(map);
+      if (json.length <= 95000) {
+        cache.put('mcc_merchant_map', json, 21600); // 6 hours
+        Logger.log('MCC database cached (' + json.length + ' bytes, 6 h TTL)');
+      } else {
+        Logger.log('MCC database too large to cache ('
+                 + json.length + ' bytes) — will re-fetch each execution');
+      }
+    } catch (e) { Logger.log('MCC cache write failed: ' + e); }
+
+    return map;
   } catch (e) {
-    Logger.log('MCC Explorer error for "' + merchantName + '": ' + e);
+    Logger.log('MCC database fetch error: ' + e);
     return null;
   }
 }
 
 /**
- * Test function — run from Apps Script editor to check the API key and
- * merchant lookup endpoint.  Tries a few known Singapore merchants.
- * Check the Execution Log for results.
+ * Looks up a merchant name against the MCC Explorer database.
+ * Strategy: check whether any known merchant name is a substring of the email
+ * description. Email descriptions often append location (e.g. "Wingstop Singapore"
+ * → matches "Wingstop" in MCC 5814's list). We prefer the longest match to
+ * avoid short names ("EAT") incorrectly matching longer strings ("EATALY").
  *
- * Note: 403 responses mean your account is on the Free tier (lookup is Pro+).
- * 200 responses mean Pro is active and auto-classification will work.
+ * Returns { mcc, category } or null if no match / not configured.
+ */
+function lookupMCCExplorer(merchantName) {
+  var db = fetchMCCDatabase();
+  if (!db) return null;
+
+  var nameUpper = merchantName.toUpperCase().trim();
+  var bestMatch = null;
+  var bestLen   = 0;
+
+  var knownNames = Object.keys(db);
+  for (var i = 0; i < knownNames.length; i++) {
+    var known = knownNames[i]; // already uppercase, min 4 chars
+    if (nameUpper.indexOf(known) !== -1 && known.length > bestLen) {
+      bestLen   = known.length;
+      bestMatch = db[known];
+    }
+  }
+
+  if (bestMatch) {
+    Logger.log('MCC Explorer match: "' + merchantName
+             + '" → MCC ' + bestMatch.mcc + ' (' + bestMatch.category + ')');
+    return bestMatch;
+  }
+
+  Logger.log('MCC Explorer: no match for "' + merchantName + '"');
+  return null;
+}
+
+/**
+ * One-shot test function — run from Apps Script editor to verify the API key,
+ * base URL, and response shape.  Check the Execution Log for results.
  */
 function testMCCExplorerAPI() {
-  var tests = ['Wingstop', 'McDonald', 'Grab', 'Netflix', 'Starbucks'];
+  _mccDatabase = null; // force fresh fetch, ignore any in-memory cache
+  CacheService.getScriptCache().remove('mcc_merchant_map'); // clear disk cache too
+  var db = fetchMCCDatabase();
+  if (!db) {
+    Logger.log('TEST FAILED: database is null — check MCC_EXPLORER_KEY and MCC_API_BASE');
+    return;
+  }
+  Logger.log('TEST PASS: ' + Object.keys(db).length + ' merchant entries loaded');
+  // Spot-check a few known merchants
+  var tests = ['WINGSTOP', 'MCDONALD', 'GRAB', 'NETFLIX', 'STARBUCKS'];
   for (var i = 0; i < tests.length; i++) {
     var result = lookupMCCExplorer(tests[i]);
-    Logger.log(tests[i] + ' → ' + (result ? JSON.stringify(result) : 'no match / not on Pro tier'));
+    Logger.log(tests[i] + ' → ' + (result ? JSON.stringify(result) : 'no match'));
   }
 }
 
@@ -877,6 +953,42 @@ function autoRegisterMerchant(rawMerchant) {
     mcc,           // pre-filled by MCC Explorer if available
     notes
   );
+}
+
+/**
+ * One-shot bulk import of known merchants into the Merchants tab.
+ * Merchant data is provided manually (MCC looked up from mccexplorer.com).
+ * Run once from the Apps Script editor; safe to re-run — duplicate guard skips existing rows.
+ *
+ * To add a new batch: update the merchants array below and run again.
+ *
+ * Data format:
+ *   { matchKey, displayName, category, mcc }
+ *   matchKey  — uppercase substring that will match against raw email merchant names
+ *   mcc       — drives HSBC Eligible (col D) and Citi Online (col E) automatically
+ */
+function runBulkImport() {
+  var merchants = [
+    // ── Populate from user-provided MCC data ──
+    // Example:
+    // { matchKey: 'MCDONALD',  displayName: "McDonald's",  category: 'Food', mcc: '5814' },
+  ];
+
+  var added = 0, skipped = 0;
+  merchants.forEach(function(m) {
+    if (lookupMerchant(m.matchKey)) { skipped++; return; }
+    addMerchantToTable(
+      m.matchKey,
+      m.displayName,
+      m.category,
+      mccToHsbcEligible(m.mcc),
+      mccToCitiOnline(m.mcc),
+      m.mcc,
+      'Bulk import MCC ' + m.mcc
+    );
+    added++;
+  });
+  Logger.log('Bulk import: ' + added + ' added, ' + skipped + ' skipped (already existed)');
 }
 
 /** Build an 11-element array matching column order A–K */
@@ -1502,96 +1614,6 @@ function testPOSBEverydayParse() {
                        reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
     Logger.log('Row: ' + JSON.stringify(row));
   }
-}
-
-/**
- * Enriches Merchants tab rows where the user has manually filled in the MCC
- * Code (column F) but left Category, HSBC Eligible, or Citi Online blank.
- *
- * Workflow:
- *   1. A new merchant appears → auto-added to Merchants tab with "Needs classification"
- *   2. You Google the merchant name + "MCC code" (e.g. "Wingstop MCC code" → 5814)
- *   3. Type the MCC number into column F of that row
- *   4. Run enrichMerchantsFromMCC() — this fills in Category, HSBC Eligible,
- *      Citi Online automatically and updates the Notes column
- *   5. All future transactions from that merchant use the correct reward rate
- *
- * Uses the free-tier MCC Explorer API to fetch the official category description.
- * HSBC and Citi eligibility are determined from the T&C rules in mccToHsbcEligible()
- * and mccToCitiOnline() — no Pro tier required for this function.
- *
- * Run from the Apps Script editor after filling in MCC codes in the sheet.
- */
-function enrichMerchantsFromMCC() {
-  var apiKey = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
-  var ss     = SpreadsheetApp.openById(SHEET_ID);
-  var sheet  = ss.getSheetByName(MERCHANTS_TAB);
-  if (!sheet) {
-    Logger.log('enrichMerchantsFromMCC: Merchants tab not found');
-    return;
-  }
-
-  var rows    = sheet.getDataRange().getValues();
-  var updated = 0;
-
-  for (var i = 1; i < rows.length; i++) {  // skip header row
-    var mcc          = rows[i][5] ? rows[i][5].toString().trim() : '';
-    var category     = rows[i][2] ? rows[i][2].toString().trim() : '';
-    var hsbcEligible = rows[i][3] ? rows[i][3].toString().trim() : '';
-    var citiOnline   = rows[i][4] ? rows[i][4].toString().trim() : '';
-
-    // Only process rows that have an MCC but are missing at least one field
-    if (!mcc) continue;
-    if (category && hsbcEligible && citiOnline) continue; // already complete
-
-    // Determine eligibility from T&C rules (no API needed)
-    var newHsbc = hsbcEligible || mccToHsbcEligible(mcc);
-    var newCiti = citiOnline   || mccToCitiOnline(mcc);
-
-    // Fetch official category description from free-tier API (optional — skipped if no key)
-    var newCategory = category;
-    if (!newCategory && apiKey) {
-      try {
-        var url = 'https://mccexplorer.com/api/v2.1/mcc-codes/' + encodeURIComponent(mcc);
-        var resp = UrlFetchApp.fetch(url, {
-          method: 'get',
-          headers: { 'x-api-key': apiKey },
-          muteHttpExceptions: true
-        });
-        if (resp.getResponseCode() === 200) {
-          var json = JSON.parse(resp.getContentText());
-          if (json.data && json.data.category) {
-            newCategory = json.data.category;
-          }
-        }
-      } catch (e) {
-        Logger.log('enrichMerchantsFromMCC: API error for MCC ' + mcc + ': ' + e);
-      }
-    }
-
-    // Build a human-readable note
-    var eligSummary = [];
-    if (newHsbc === 'YES') eligSummary.push('HSBC 4mpd');
-    else if (newHsbc === 'NO') eligSummary.push('HSBC 0.4mpd');
-    if (newCiti === 'NO') eligSummary.push('Citi excluded');
-    var newNotes = 'MCC ' + mcc + (eligSummary.length ? ' — ' + eligSummary.join(', ') : ' — verify eligibility');
-
-    // Write back only the columns that changed (rowIndex is 1-based, +1 for header)
-    var rowNum = i + 1;
-    if (newCategory     && newCategory     !== category)     sheet.getRange(rowNum, 3).setValue(newCategory);
-    if (newHsbc                            !== hsbcEligible) sheet.getRange(rowNum, 4).setValue(newHsbc);
-    if (newCiti                            !== citiOnline)   sheet.getRange(rowNum, 5).setValue(newCiti);
-    sheet.getRange(rowNum, 7).setValue(newNotes);
-
-    Logger.log('Enriched row ' + rowNum + ': matchKey=' + rows[i][0]
-             + ' MCC=' + mcc + ' category=' + newCategory
-             + ' HSBC=' + newHsbc + ' Citi=' + newCiti);
-    updated++;
-  }
-
-  _merchantsCache = null;  // clear cache so next lookups see the updated data
-  SpreadsheetApp.flush();
-  Logger.log('enrichMerchantsFromMCC: updated ' + updated + ' rows');
 }
 
 /**
