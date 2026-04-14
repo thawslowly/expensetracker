@@ -969,9 +969,44 @@ function autoRegisterMerchant(rawMerchant) {
  */
 function runBulkImport() {
   var merchants = [
-    // ── Populate from user-provided MCC data ──
-    // Example:
-    // { matchKey: 'MCDONALD',  displayName: "McDonald's",  category: 'Food', mcc: '5814' },
+    // ── MCC 5814 — Fast Food Restaurants (HSBC: NO, Citi Online: '') ──
+    { matchKey: 'MCDONALD',     displayName: "McDonald's",             category: 'Food', mcc: '5814' },
+    { matchKey: 'KFC',          displayName: 'KFC',                    category: 'Food', mcc: '5814' },
+    { matchKey: 'BURGER KING',  displayName: 'Burger King',            category: 'Food', mcc: '5814' },
+    { matchKey: 'SUBWAY',       displayName: 'Subway',                 category: 'Food', mcc: '5814' },
+    { matchKey: 'PIZZA HUT',    displayName: 'Pizza Hut',              category: 'Food', mcc: '5814' },
+    { matchKey: 'OLD CHANG KEE',displayName: 'Old Chang Kee',          category: 'Food', mcc: '5814' },
+    { matchKey: '4FINGERS',     displayName: '4Fingers Crispy Chicken',category: 'Food', mcc: '5814' },
+    { matchKey: 'FOUR FINGER',  displayName: '4Fingers Crispy Chicken',category: 'Food', mcc: '5814' },
+    { matchKey: 'DOMINO',       displayName: "Domino's",               category: 'Food', mcc: '5814' },
+    { matchKey: 'ARNOLDS',      displayName: "Arnold's Fried Chicken", category: 'Food', mcc: '5814' },
+    { matchKey: 'AUNTIE ANNE',  displayName: "Auntie Anne's",          category: 'Food', mcc: '5814' },
+    { matchKey: 'A&W',          displayName: 'A&W',                    category: 'Food', mcc: '5814' },
+    { matchKey: 'BEARD PAPA',   displayName: 'Beard Papa',             category: 'Food', mcc: '5814' },
+    { matchKey: 'CARLS',        displayName: "Carl's Junior",          category: 'Food', mcc: '5814' },
+    { matchKey: 'DUNKIN',       displayName: 'Dunkin Donuts',          category: 'Food', mcc: '5814' },
+    { matchKey: 'GUZMAN',       displayName: 'Guzman Y Gomez',         category: 'Food', mcc: '5814' },
+    { matchKey: 'JOLLIBEE',     displayName: 'Jollibee',               category: 'Food', mcc: '5814' },
+    { matchKey: 'JOLLIBEAN',    displayName: 'Jollibean',              category: 'Food', mcc: '5814' },
+    { matchKey: 'LONG JOHN',    displayName: 'Long John Silvers',      category: 'Food', mcc: '5814' },
+    { matchKey: 'MOS BURGER',   displayName: 'MOS Burger',             category: 'Food', mcc: '5814' },
+    { matchKey: 'MR BEAN',      displayName: 'Mr Bean',                category: 'Food', mcc: '5814' },
+    { matchKey: 'PEZZO',        displayName: 'Pezzo',                  category: 'Food', mcc: '5814' },
+    { matchKey: 'POPEYES',      displayName: 'Popeyes Louisiana Kitchen', category: 'Food', mcc: '5814' },
+    { matchKey: 'SHAKE SHACK',  displayName: 'Shake Shack',            category: 'Food', mcc: '5814' },
+    { matchKey: 'TACO BELL',    displayName: 'Taco Bell',              category: 'Food', mcc: '5814' },
+    { matchKey: 'TORI-Q',       displayName: 'Tori-Q',                 category: 'Food', mcc: '5814' },
+    { matchKey: 'WENDY',        displayName: "Wendy's",                category: 'Food', mcc: '5814' },
+    { matchKey: 'WINGSTOP',     displayName: 'Wingstop',               category: 'Food', mcc: '5814' },
+    { matchKey: 'JINJJA',       displayName: 'Jinjja Chicken',         category: 'Food', mcc: '5814' },
+    { matchKey: 'CHICKEN UP',   displayName: 'Chicken Up',             category: 'Food', mcc: '5814' },
+    { matchKey: 'GREENDOT',     displayName: 'Greendot',               category: 'Food', mcc: '5814' },
+    { matchKey: 'QIJI',         displayName: 'Qiji',                   category: 'Food', mcc: '5814' },
+    { matchKey: 'PEPPER LUNCH', displayName: 'Pepper Lunch',           category: 'Food', mcc: '5814' },
+    { matchKey: 'SALAD STOP',   displayName: 'Salad Stop',             category: 'Food', mcc: '5814' },
+    { matchKey: 'SOUP SPOON',   displayName: 'Soup Spoon',             category: 'Food', mcc: '5814' },
+    { matchKey: 'STUFFD',       displayName: "Stuff'd",                category: 'Food', mcc: '5814' },
+    { matchKey: 'PROJECT ACAI', displayName: 'Project Acai',           category: 'Food', mcc: '5814' },
   ];
 
   var added = 0, skipped = 0;
