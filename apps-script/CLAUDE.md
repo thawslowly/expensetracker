@@ -64,7 +64,7 @@ Persistent lookup table checked **before** keyword arrays. Checked via substring
 ### Key Functions
 - `lookupMerchant(name)` — substring match; returns first matching record or null
 - `addMerchantToTable(...)` — appends row, skips duplicates, clears cache
-- `autoRegisterMerchant(raw)` — called on every new transaction; writes blank row if merchant unknown
+- `autoRegisterMerchant(raw)` — called on every new transaction; writes blank row (`Needs classification`) if merchant unknown; no MCC lookup
 - `mccToHsbcEligible(mcc)` — maps MCC → `YES`/`NO`/`''` per HSBC T&C
 - `mccToCitiOnline(mcc)` — maps travel MCCs → `NO`; everything else `''`
 - `runBulkImport()` — one-shot batch load from hardcoded array; safe to re-run (duplicate guard)
@@ -75,7 +75,7 @@ Persistent lookup table checked **before** keyword arrays. Checked via substring
 User provides merchants grouped by MCC in chat → I populate `runBulkImport()` array → user pastes Code.gs into Apps Script editor and runs `runBulkImport()` once. Re-running is safe — duplicate guard skips existing rows.
 
 ### MCC Explorer API
-**Not configured, not needed.** MCC Explorer does not reliably identify Singapore merchants. Manual MCC lookup and `runBulkImport()` is the preferred approach. `lookupMCCExplorer()` and `fetchMCCDatabase()` remain in code but return null without an API key — no impact on operation.
+**Removed (Apr 2026).** `lookupMCCExplorer()` and `fetchMCCDatabase()` have been deleted from Code.gs — they did not reliably identify Singapore merchants and caused a `ReferenceError` on every run. Manual MCC lookup via `runBulkImport()` is the only approach.
 
 ### Obscured Merchant Names (Pipeline To-Do)
 Some transactions produce dynamic/junk merchant strings that should not pollute the Merchants tab, e.g.:

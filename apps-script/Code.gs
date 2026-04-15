@@ -663,158 +663,10 @@ function lookupMerchant(merchantName) {
   return null;
 }
 
-/**
- * Fetches all MCC codes from MCC Explorer and builds a flat merchant-name →
- * {mcc, category} lookup map.  The full database is fetched once per script
- * execution (module-level cache) and also stored in CacheService for 6 hours
- * so subsequent trigger runs don't hit the API unnecessarily.
- *
- * Returns the map object, or null if no API key / fetch failed.
- *
- * NOTE: If the base URL below returns a 404, check your MCC Explorer dashboard
- * for the correct API base URL and update the constant here.
- */
-var MCC_API_BASE = 'https://www.mccexplorer.com';
+// MCC Explorer API removed — did not reliably identify Singapore merchants.
+// MCC lookup is now done manually: user provides merchant→MCC groupings,
+// which are batch-loaded via runBulkImport().
 
-function fetchMCCDatabase() {
-  // 1. In-memory cache (same execution)
-  if (_mccDatabase !== null) return _mccDatabase;
-
-  var apiKey = PropertiesService.getScriptProperties().getProperty('MCC_EXPLORER_KEY');
-  if (!apiKey) return null;
-
-  // 2. CacheService (cross-execution, 6-hour TTL)
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get('mcc_merchant_map');
-  if (cached) {
-    try {
-      _mccDatabase = JSON.parse(cached);
-      Logger.log('MCC database loaded from cache ('
-               + Object.keys(_mccDatabase).length + ' merchant entries)');
-      return _mccDatabase;
-    } catch (e) { /* corrupt cache — fall through to re-fetch */ }
-  }
-
-  // 3. Fetch from API
-  Logger.log('Fetching MCC database from API...');
-  try {
-    var response = UrlFetchApp.fetch(MCC_API_BASE + '/api/v2.1/mcc-codes', {
-      method: 'get',
-      headers: { 'x-api-key': apiKey },
-      muteHttpExceptions: true
-    });
-    if (response.getResponseCode() !== 200) {
-      Logger.log('MCC API error: HTTP ' + response.getResponseCode()
-               + ' — ' + response.getContentText().substring(0, 200));
-      return null;
-    }
-
-    var raw = JSON.parse(response.getContentText());
-    if (!Array.isArray(raw) || raw.length === 0) {
-      // Log the raw shape so we can adjust field names if needed
-      Logger.log('MCC API unexpected response shape: '
-               + JSON.stringify(raw).substring(0, 400));
-      return null;
-    }
-
-    Logger.log('MCC API: received ' + raw.length + ' code entries. '
-             + 'First entry: ' + JSON.stringify(raw[0]).substring(0, 300));
-
-    // Flatten: for each MCC entry → each merchant name → {mcc, category}
-    // Field name fallbacks handle variation between API versions.
-    var map = {};
-    for (var i = 0; i < raw.length; i++) {
-      var entry    = raw[i];
-      var mcc      = (entry.mcc || entry.code || '').toString().trim();
-      var category = (entry.category || entry.edited_description
-                    || entry.combined_description || '').toString().trim();
-      var merchants = entry.merchants || [];
-      for (var j = 0; j < merchants.length; j++) {
-        var name = merchants[j].toString().toUpperCase().trim();
-        if (name.length >= 4 && mcc) {
-          map[name] = { mcc: mcc, category: category };
-        }
-      }
-    }
-
-    _mccDatabase = map;
-    Logger.log('MCC merchant map built: ' + Object.keys(map).length + ' entries');
-
-    // Cache if it fits within CacheService's 100 KB per-key limit
-    try {
-      var json = JSON.stringify(map);
-      if (json.length <= 95000) {
-        cache.put('mcc_merchant_map', json, 21600); // 6 hours
-        Logger.log('MCC database cached (' + json.length + ' bytes, 6 h TTL)');
-      } else {
-        Logger.log('MCC database too large to cache ('
-                 + json.length + ' bytes) — will re-fetch each execution');
-      }
-    } catch (e) { Logger.log('MCC cache write failed: ' + e); }
-
-    return map;
-  } catch (e) {
-    Logger.log('MCC database fetch error: ' + e);
-    return null;
-  }
-}
-
-/**
- * Looks up a merchant name against the MCC Explorer database.
- * Strategy: check whether any known merchant name is a substring of the email
- * description. Email descriptions often append location (e.g. "Wingstop Singapore"
- * → matches "Wingstop" in MCC 5814's list). We prefer the longest match to
- * avoid short names ("EAT") incorrectly matching longer strings ("EATALY").
- *
- * Returns { mcc, category } or null if no match / not configured.
- */
-function lookupMCCExplorer(merchantName) {
-  var db = fetchMCCDatabase();
-  if (!db) return null;
-
-  var nameUpper = merchantName.toUpperCase().trim();
-  var bestMatch = null;
-  var bestLen   = 0;
-
-  var knownNames = Object.keys(db);
-  for (var i = 0; i < knownNames.length; i++) {
-    var known = knownNames[i]; // already uppercase, min 4 chars
-    if (nameUpper.indexOf(known) !== -1 && known.length > bestLen) {
-      bestLen   = known.length;
-      bestMatch = db[known];
-    }
-  }
-
-  if (bestMatch) {
-    Logger.log('MCC Explorer match: "' + merchantName
-             + '" → MCC ' + bestMatch.mcc + ' (' + bestMatch.category + ')');
-    return bestMatch;
-  }
-
-  Logger.log('MCC Explorer: no match for "' + merchantName + '"');
-  return null;
-}
-
-/**
- * One-shot test function — run from Apps Script editor to verify the API key,
- * base URL, and response shape.  Check the Execution Log for results.
- */
-function testMCCExplorerAPI() {
-  _mccDatabase = null; // force fresh fetch, ignore any in-memory cache
-  CacheService.getScriptCache().remove('mcc_merchant_map'); // clear disk cache too
-  var db = fetchMCCDatabase();
-  if (!db) {
-    Logger.log('TEST FAILED: database is null — check MCC_EXPLORER_KEY and MCC_API_BASE');
-    return;
-  }
-  Logger.log('TEST PASS: ' + Object.keys(db).length + ' merchant entries loaded');
-  // Spot-check a few known merchants
-  var tests = ['WINGSTOP', 'MCDONALD', 'GRAB', 'NETFLIX', 'STARBUCKS'];
-  for (var i = 0; i < tests.length; i++) {
-    var result = lookupMCCExplorer(tests[i]);
-    Logger.log(tests[i] + ' → ' + (result ? JSON.stringify(result) : 'no match'));
-  }
-}
 
 /**
  * Maps an MCC code to HSBC Revolution bonus eligibility.
@@ -928,30 +780,20 @@ function resolveContext(rawMerchant) {
 
 /**
  * Registers a merchant in the Merchants table the first time it is seen.
- * Calls MCC Explorer to pre-fill MCC and Category if an API key is configured.
+ * All fields are left blank for the user to fill in via runBulkImport() or manually.
  * Safe to call on every transaction — skips silently if merchant already exists.
  */
 function autoRegisterMerchant(rawMerchant) {
   if (lookupMerchant(rawMerchant)) return; // already known
 
-  var mccResult    = lookupMCCExplorer(rawMerchant); // null if no API key set
-  var mcc          = mccResult ? mccResult.mcc      : '';
-  var category     = mccResult ? mccResult.category : '';
-  var hsbcEligible = mcc ? mccToHsbcEligible(mcc) : '';
-  var citiOnline   = mcc ? mccToCitiOnline(mcc)   : '';
-
-  // 'Review MCC XXXX' prompts user to confirm the auto-guess; 'Needs classification'
-  // means no MCC was found and both eligibility fields need to be filled manually.
-  var notes = mcc ? 'Review MCC ' + mcc : 'Needs classification';
-
   addMerchantToTable(
-    rawMerchant,   // matchKey — uppercased inside addMerchantToTable()
-    '',            // displayName — user fills in
-    category,      // pre-filled by MCC Explorer if available
-    hsbcEligible,  // auto-determined from MCC if available
-    citiOnline,    // auto-determined from MCC if available
-    mcc,           // pre-filled by MCC Explorer if available
-    notes
+    rawMerchant,        // matchKey — uppercased inside addMerchantToTable()
+    '',                 // displayName — user fills in
+    '',                 // category — user fills in via runBulkImport()
+    '',                 // hsbcEligible — user fills in
+    '',                 // citiOnline — user fills in
+    '',                 // mcc — user fills in
+    'Needs classification'
   );
 }
 
@@ -967,90 +809,79 @@ function autoRegisterMerchant(rawMerchant) {
  *   matchKey  — uppercase substring that will match against raw email merchant names
  *   mcc       — drives HSBC Eligible (col D) and Citi Online (col E) automatically
  */
-function runBulkImport() {
-  var merchants = [
-    // ── MCC 5814 — Fast Food Restaurants (HSBC: NO, Citi Online: '') ──
-    { matchKey: 'MCDONALD',     displayName: "McDonald's",             category: 'Food', mcc: '5814' },
-    { matchKey: 'KFC',          displayName: 'KFC',                    category: 'Food', mcc: '5814' },
-    { matchKey: 'BURGER KING',  displayName: 'Burger King',            category: 'Food', mcc: '5814' },
-    { matchKey: 'SUBWAY',       displayName: 'Subway',                 category: 'Food', mcc: '5814' },
-    { matchKey: 'PIZZA HUT',    displayName: 'Pizza Hut',              category: 'Food', mcc: '5814' },
-    { matchKey: 'OLD CHANG KEE',displayName: 'Old Chang Kee',          category: 'Food', mcc: '5814' },
-    { matchKey: '4FINGERS',     displayName: '4Fingers Crispy Chicken',category: 'Food', mcc: '5814' },
-    { matchKey: 'FOUR FINGER',  displayName: '4Fingers Crispy Chicken',category: 'Food', mcc: '5814' },
-    { matchKey: 'DOMINO',       displayName: "Domino's",               category: 'Food', mcc: '5814' },
-    { matchKey: 'ARNOLDS',      displayName: "Arnold's Fried Chicken", category: 'Food', mcc: '5814' },
-    { matchKey: 'AUNTIE ANNE',  displayName: "Auntie Anne's",          category: 'Food', mcc: '5814' },
-    { matchKey: 'A&W',          displayName: 'A&W',                    category: 'Food', mcc: '5814' },
-    { matchKey: 'BEARD PAPA',   displayName: 'Beard Papa',             category: 'Food', mcc: '5814' },
-    { matchKey: 'CARLS',        displayName: "Carl's Junior",          category: 'Food', mcc: '5814' },
-    { matchKey: 'DUNKIN',       displayName: 'Dunkin Donuts',          category: 'Food', mcc: '5814' },
-    { matchKey: 'GUZMAN',       displayName: 'Guzman Y Gomez',         category: 'Food', mcc: '5814' },
-    { matchKey: 'JOLLIBEE',     displayName: 'Jollibee',               category: 'Food', mcc: '5814' },
-    { matchKey: 'JOLLIBEAN',    displayName: 'Jollibean',              category: 'Food', mcc: '5814' },
-    { matchKey: 'LONG JOHN',    displayName: 'Long John Silvers',      category: 'Food', mcc: '5814' },
-    { matchKey: 'MOS BURGER',   displayName: 'MOS Burger',             category: 'Food', mcc: '5814' },
-    { matchKey: 'MR BEAN',      displayName: 'Mr Bean',                category: 'Food', mcc: '5814' },
-    { matchKey: 'PEZZO',        displayName: 'Pezzo',                  category: 'Food', mcc: '5814' },
-    { matchKey: 'POPEYES',      displayName: 'Popeyes Louisiana Kitchen', category: 'Food', mcc: '5814' },
-    { matchKey: 'SHAKE SHACK',  displayName: 'Shake Shack',            category: 'Food', mcc: '5814' },
-    { matchKey: 'TACO BELL',    displayName: 'Taco Bell',              category: 'Food', mcc: '5814' },
-    { matchKey: 'TORI-Q',       displayName: 'Tori-Q',                 category: 'Food', mcc: '5814' },
-    { matchKey: 'WENDY',        displayName: "Wendy's",                category: 'Food', mcc: '5814' },
-    { matchKey: 'WINGSTOP',     displayName: 'Wingstop',               category: 'Food', mcc: '5814' },
-    { matchKey: 'JINJJA',       displayName: 'Jinjja Chicken',         category: 'Food', mcc: '5814' },
-    { matchKey: 'CHICKEN UP',   displayName: 'Chicken Up',             category: 'Food', mcc: '5814' },
-    { matchKey: 'GREENDOT',     displayName: 'Greendot',               category: 'Food', mcc: '5814' },
-    { matchKey: 'QIJI',         displayName: 'Qiji',                   category: 'Food', mcc: '5814' },
-    { matchKey: 'PEPPER LUNCH', displayName: 'Pepper Lunch',           category: 'Food', mcc: '5814' },
-    { matchKey: 'SALAD STOP',   displayName: 'Salad Stop',             category: 'Food', mcc: '5814' },
-    { matchKey: 'SOUP SPOON',   displayName: 'Soup Spoon',             category: 'Food', mcc: '5814' },
-    { matchKey: 'STUFFD',       displayName: "Stuff'd",                category: 'Food', mcc: '5814' },
-    { matchKey: 'PROJECT ACAI', displayName: 'Project Acai',           category: 'Food', mcc: '5814' },
+/**
+ * Sheet-driven bulk import. Reads from the "BulkImport" tab.
+ * Columns: A = Merchant Name | B = MCC | C = Category (optional, defaults to "Food")
+ *
+ * matchKey is auto-generated: strip trailing location suffix like "(Jem)", uppercase.
+ *   "Ichiban Boshi (Jem)" → matchKey "ICHIBAN BOSHI"
+ * Duplicate chains with multiple location rows collapse to one matchKey automatically.
+ *
+ * Safe to re-run — existing matchKeys are skipped.
+ * To import a new MCC batch: update col A & B in the BulkImport tab, re-run.
+ */
+function runSheetImport() {
+  var ss          = SpreadsheetApp.openById(SHEET_ID);
+  var importSheet = ss.getSheetByName('BulkImport');
+  if (!importSheet) {
+    Logger.log('runSheetImport: BulkImport tab not found. Run setupBulkImportTab() first.');
+    return;
+  }
 
-    // ── MCC 5814 — Bubble Tea ──
-    { matchKey: 'LIHO',         displayName: 'LiHO Tea',               category: 'Food', mcc: '5814' },
-    { matchKey: 'GONG CHA',     displayName: 'Gong Cha',               category: 'Food', mcc: '5814' },
-    { matchKey: 'TIGER SUGAR',  displayName: 'Tiger Sugar',            category: 'Food', mcc: '5814' },
-    { matchKey: 'KOI THE',      displayName: 'Koi Thé',                category: 'Food', mcc: '5814' },
-    { matchKey: 'KOI CAFE',     displayName: 'Koi Café',               category: 'Food', mcc: '5814' },
-    { matchKey: 'MR COCONUT',   displayName: 'Mr Coconut',             category: 'Food', mcc: '5814' },
-    { matchKey: 'CHATIME',      displayName: 'Chatime',                category: 'Food', mcc: '5814' },
-    { matchKey: 'COCO FRESH',   displayName: 'CoCo Fresh Tea & Juice', category: 'Food', mcc: '5814' },
-    { matchKey: 'COMEBUYTEA',   displayName: 'Comebuytea',             category: 'Food', mcc: '5814' },
-    { matchKey: 'R&B TEA',      displayName: 'R&B Tea',                category: 'Food', mcc: '5814' },
-    { matchKey: 'SUPER TEA',    displayName: 'Super Tea',              category: 'Food', mcc: '5814' },
-    { matchKey: 'BUBBLE NINI',  displayName: 'Bubble Nini',            category: 'Food', mcc: '5814' },
+  var data   = importSheet.getDataRange().getValues();
+  var added  = 0, skipped = 0, errors = 0;
 
-    // ── MCC 5814 — Cafes ──
-    { matchKey: 'CRAFTSMEN',    displayName: 'Craftsmen Specialty Coffee', category: 'Food', mcc: '5814' },
-    { matchKey: 'DAYBREAK',     displayName: 'Daybreak Cafe',          category: 'Food', mcc: '5814' },
-    { matchKey: 'DEVON CAFE',   displayName: 'Devon Cafe',             category: 'Food', mcc: '5814' },
-    { matchKey: 'DUTCH SMUGGLER',displayName: 'Dutch Smuggler Coffee', category: 'Food', mcc: '5814' },
-    { matchKey: 'HAVEN SPECIALTY',displayName: 'Haven Specialty Coffee',category: 'Food', mcc: '5814' },
-    { matchKey: 'KILLINEY',     displayName: 'Killiney Kopitiam',      category: 'Food', mcc: '5814' },
-    { matchKey: 'MR TULK',      displayName: 'Mr Tulk Cafe',           category: 'Food', mcc: '5814' },
-    { matchKey: 'PABLO',        displayName: "Pablo & Rusty's",        category: 'Food', mcc: '5814' },
-    { matchKey: 'PAWA',         displayName: 'Pawa Cafe & Bar',        category: 'Food', mcc: '5814' },
-    { matchKey: 'MOS CAFE',     displayName: 'MOS Cafe',               category: 'Food', mcc: '5814' },
-    { matchKey: 'HANS',         displayName: 'Hans',                   category: 'Food', mcc: '5814' },
-  ];
+  for (var i = 1; i < data.length; i++) {        // row 0 is the header
+    var rawName  = String(data[i][0]).trim();
+    var mcc      = String(data[i][1]).trim();
+    var category = String(data[i][2]).trim() || 'Food';
 
-  var added = 0, skipped = 0;
-  merchants.forEach(function(m) {
-    if (lookupMerchant(m.matchKey)) { skipped++; return; }
-    addMerchantToTable(
-      m.matchKey,
-      m.displayName,
-      m.category,
-      mccToHsbcEligible(m.mcc),
-      mccToCitiOnline(m.mcc),
-      m.mcc,
-      'Bulk import MCC ' + m.mcc
-    );
-    added++;
-  });
-  Logger.log('Bulk import: ' + added + ' added, ' + skipped + ' skipped (already existed)');
+    if (!rawName) continue;                       // skip blank rows
+
+    // Strip trailing location suffix, e.g. "(Jem)" or "(Jurong Point)"
+    var matchKey = rawName.replace(/\s*\([^)]*\)\s*$/, '').trim().toUpperCase();
+
+    if (lookupMerchant(matchKey)) { skipped++; continue; }
+
+    try {
+      addMerchantToTable(
+        matchKey,
+        rawName,
+        category,
+        mccToHsbcEligible(mcc),
+        mccToCitiOnline(mcc),
+        mcc,
+        'Bulk import MCC ' + mcc
+      );
+      added++;
+    } catch (e) {
+      Logger.log('runSheetImport: error on row ' + (i + 1) + ' (' + rawName + '): ' + e.toString());
+      errors++;
+    }
+  }
+
+  Logger.log('Sheet import complete — added: ' + added + ', skipped: ' + skipped + ', errors: ' + errors);
+}
+
+/**
+ * One-time setup: creates the BulkImport staging tab.
+ * Run this once, then paste merchant names into col A and the MCC into col B.
+ */
+function setupBulkImportTab() {
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName('BulkImport');
+  if (sheet) {
+    Logger.log('setupBulkImportTab: tab already exists — nothing to do');
+    return;
+  }
+  sheet = ss.insertSheet('BulkImport');
+  sheet.getRange(1, 1, 1, 3).setValues([['Merchant Name', 'MCC', 'Category']]);
+  sheet.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#fce5cd');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 260);
+  sheet.setColumnWidth(2, 80);
+  sheet.setColumnWidth(3, 100);
+  Logger.log('setupBulkImportTab: BulkImport tab created');
 }
 
 /** Build an 11-element array matching column order A–K */
