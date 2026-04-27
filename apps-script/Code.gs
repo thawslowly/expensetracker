@@ -221,15 +221,20 @@ function processCitiEmails(label, processedIds) {
       var context  = rawDetail.replace(/^AMAZE\*\s*/i, '').replace(/^INSTAREM\s*/i, '').trim();
       // Clean trailing country code (e.g. "Singapore SGP" → "Singapore")
       context = context.replace(/\s+[A-Z]{3}$/, '').trim();
+      context = normalizeContext(context);
 
-      var card     = 'CitiRewards';
+      // Detect card type from email body ("Citi Cashback+ Card" vs "Citi Rewards Card")
+      var isCashbackCard = /citi\s*cashback\+/i.test(body);
+      var card     = isCashbackCard ? 'CitiCashback+' : 'CitiRewards';
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
       var category = guessCategory(context);
       var remarks  = isAmaze ? 'Via Amaze' : '';
 
       // ── Reward calculation ──────────────────────────────
-      var reward   = calcCitiReward(context, currency, amount, isAmaze);
+      var reward   = isCashbackCard
+        ? calcCitiCashbackReward(amount)
+        : calcCitiReward(context, currency, amount, isAmaze);
 
       var row = buildRow(txnDate, amount, category, displayContext, card, currency,
                          reward.bonusEligible, reward.rate, reward.estReward, remarks);
@@ -368,7 +373,7 @@ function processHSBCEmails(label, processedIds) {
       var txnDate  = txnDateMatch ? parseHSBCDate(txnDateMatch[1]) : emailDate;
       var currency = txnAmtMatch[1].toUpperCase();
       var amount   = parseFloat(txnAmtMatch[2].replace(/,/g, ''));
-      var context  = descMatch[1].replace(/\s+/g, ' ').trim();
+      var context  = normalizeContext(descMatch[1].replace(/\s+/g, ' ').trim());
 
       var card     = 'HSBC Revolution';
       autoRegisterMerchant(context);
@@ -441,7 +446,7 @@ function processPOSBEverydayEmails(label, processedIds) {
 
       // Strip trailing 3-letter country code from merchant name (e.g. "BUS/MRT SINGAPORE SGP")
       var rawMerchant = toMatch ? toMatch[1].trim() : 'Unknown';
-      var context     = rawMerchant.replace(/\s+[A-Z]{3}$/, '').trim();
+      var context     = normalizeContext(rawMerchant.replace(/\s+[A-Z]{3}$/, '').trim());
 
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
@@ -472,6 +477,11 @@ function processPOSBEverydayEmails(label, processedIds) {
 // ─────────────────────────────────────────────────────────────
 // REWARD CALCULATORS
 // ─────────────────────────────────────────────────────────────
+
+function calcCitiCashbackReward(amount) {
+  // Citi CashBack+ Card: flat 1.6% cashback on all spend, no exclusions
+  return { bonusEligible: 'YES', rate: '1.6%', estReward: round2(amount * 0.016) };
+}
 
 function calcCitiReward(merchant, currency, amount, isAmaze) {
   var upper = merchant.toUpperCase();
@@ -751,6 +761,44 @@ function addMerchantToTable(matchKey, displayName, category, hsbcEligible, citiO
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * Strips location suffixes from merchant strings so that one Merchants table
+ * entry covers all location variants of the same chain.
+ *
+ * Applied before autoRegisterMerchant() in every parser, so new locations
+ * of a known merchant never create a duplicate row.
+ *
+ * Rules (applied in order):
+ *  1. GRAB* booking codes  → "GRAB* A-98IFM9CGWAWRAV SINGAPORE" → "GRAB*"
+ *  2. @ separator          → "STARBUCKS@WEST COAST" → "STARBUCKS"
+ *                            "KOPITIAM @VIVO SINGAPORE" → "KOPITIAM"
+ *  3. " - " separator      → "CHICHA SAN CHEN - TAMP" → "CHICHA SAN CHEN"
+ *                            "MISTER DONUT - TAMPINE" → "MISTER DONUT"
+ *  4. Trailing SINGAPORE / SGP (left over when the parser didn't pre-strip it)
+ *                            "SOME MERCHANT SINGAPORE" → "SOME MERCHANT"
+ *
+ * NOT handled here (no separator): "SPC 337 CHANGI RD", "COLD STORAGE WEST COAS".
+ * Fix those by setting a short matchKey in the Merchants table (e.g. "SPC",
+ * "COLD STORAGE") — the substring lookup then catches all location variants.
+ */
+function normalizeContext(context) {
+  // Rule 1: GRAB* dynamic booking codes
+  if (/^GRAB\*/i.test(context)) return 'GRAB*';
+
+  // Rule 2: @ separator (with optional leading space)
+  var atIdx = context.search(/\s*@/);
+  if (atIdx > 0) context = context.substring(0, atIdx).trim();
+
+  // Rule 3: " - " separator (spaces on both sides keeps "7-ELEVEN" safe)
+  var dashIdx = context.indexOf(' - ');
+  if (dashIdx > 0) context = context.substring(0, dashIdx).trim();
+
+  // Rule 4: trailing SINGAPORE or SGP
+  context = context.replace(/\s+(SINGAPORE|SGP)\s*$/i, '').trim();
+
+  return context;
+}
 
 function guessCategory(merchant) {
   // 1. Check the Merchants table first — allows per-merchant overrides

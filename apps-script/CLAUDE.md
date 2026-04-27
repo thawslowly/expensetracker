@@ -14,6 +14,7 @@
 
 ### Citibank (`alerts@citibank.com.sg`)
 Use `\s+` between words in field-name regexes — Citi emails have inconsistent formatting.
+- **Card detection:** body is checked for `"Citi Cashback+"` (case-insensitive) to distinguish the two Citi cards. Card field is set to `CitiCashback+` or `CitiRewards` accordingly, and the correct reward calculator is called.
 - Amaze: `^AMAZE\*` or `INSTAREM` prefix → strip prefix, `remarks = 'Via Amaze'`, card = `CitiRewards`
 - Date: `DD/MM/YY` → `parseCitiDate()` → stored as `DD/MMM/YYYY`
 
@@ -28,7 +29,7 @@ Table-based HTML email. Plain-text body has label on one line, value on the next
 
 ## Card Reward Logic
 
-**Miles rounding (Citi + HSBC):** `Math.floor(amount) * rate` — round down to nearest SGD1 first.
+**Miles rounding (Citi Rewards + HSBC):** `Math.floor(amount) * rate` — round down to nearest SGD1 first.
 
 ### Citi Rewards
 Exclusions → Amaze → Merchants table → online keyword fallback → base rate.
@@ -36,6 +37,9 @@ Exclusions → Amaze → Merchants table → online keyword fallback → base ra
 - **Via Amaze (4 mpd):** re-codes as online MCC
 - **Confirmed-online (4 mpd):** food delivery, ride-hailing, e-commerce, streaming — see `CITI_ONLINE_KEYWORDS`
 - **Everything else:** 0.4 mpd. Cap: S$1,000/statement month (~resets 19th).
+
+### Citi CashBack+
+Flat **1.6% cashback** on all spend. No exclusions, no tiers. `calcCitiCashbackReward(amount)` — uses full amount (no floor rounding, cashback not miles).
 
 ### HSBC Revolution
 Exclusions → Merchants table → bonus keyword fallback → base rate.
@@ -46,6 +50,19 @@ Exclusions → Merchants table → bonus keyword fallback → base rate.
 ### POSB Everyday
 Tier cashback. S$800/month minimum spend to unlock bonus tiers. Base rate 0.3%.
 
+## Merchant Name Normalisation
+
+`normalizeContext(context)` is called in every parser **before** `autoRegisterMerchant()`. It strips location suffixes so one Merchants table entry covers all location variants of the same chain.
+
+| Rule | Example input | Output |
+|------|---------------|--------|
+| GRAB* booking code | `GRAB* A-98IFM9CGWAWRAV SINGAPORE` | `GRAB*` |
+| `@` separator | `STARBUCKS@WEST COAST`, `KOPITIAM @VIVO` | `STARBUCKS`, `KOPITIAM` |
+| ` - ` separator (spaces both sides, safe for `7-ELEVEN`) | `CHICHA SAN CHEN - TAMP` | `CHICHA SAN CHEN` |
+| Trailing `SINGAPORE` / `SGP` | `SOME MERCHANT SINGAPORE` | `SOME MERCHANT` |
+
+**No-separator merchants** (e.g. `SPC 337 CHANGI RD`, `COLD STORAGE WEST COAS`): code cannot auto-strip these. Fix by setting a **short matchKey** in the Merchants table (`SPC`, `COLD STORAGE`). The substring lookup then catches all location variants — no new rows created.
+
 ## Merchants Tab
 
 Persistent lookup table checked **before** keyword arrays. Checked via substring match on Match Key.
@@ -53,7 +70,7 @@ Persistent lookup table checked **before** keyword arrays. Checked via substring
 ### Columns (A–G)
 | Col | Field | Notes |
 |-----|-------|-------|
-| A | Match Key | Uppercase substring matched against raw merchant name |
+| A | Match Key | Uppercase substring matched against raw merchant name — use shortest reliable prefix |
 | B | Display Name | Human-readable (reference only) |
 | C | Category | Food / Transport / Shopping / Subscriptions / Entertainment / Misc |
 | D | HSBC Eligible | `YES` / `NO` / blank (blank = fall back to keyword logic) |
@@ -62,48 +79,19 @@ Persistent lookup table checked **before** keyword arrays. Checked via substring
 | G | Notes | `Bulk import MCC XXXX` or `Needs classification` |
 
 ### Key Functions
+- `normalizeContext(context)` — strips location suffixes before registration and lookup
 - `lookupMerchant(name)` — substring match; returns first matching record or null
 - `addMerchantToTable(...)` — appends row, skips duplicates, clears cache
-- `autoRegisterMerchant(raw)` — called on every new transaction; writes blank row (`Needs classification`) if merchant unknown; no MCC lookup
+- `autoRegisterMerchant(raw)` — called on every new transaction; writes blank row (`Needs classification`) if merchant unknown
 - `mccToHsbcEligible(mcc)` — maps MCC → `YES`/`NO`/`''` per HSBC T&C
 - `mccToCitiOnline(mcc)` — maps travel MCCs → `NO`; everything else `''`
-- `runBulkImport()` — one-shot batch load from hardcoded array; safe to re-run (duplicate guard)
-- `setupMerchantsTab()` — one-time tab setup
+- `runSheetImport()` — reads from the `BulkImport` tab; safe to re-run (duplicate guard)
+- `setupBulkImportTab()` — one-time setup of the BulkImport staging tab
+- `setupMerchantsTab()` — one-time Merchants tab setup
 - `seedMerchantsTab()` — backfills placeholder rows from Transactions tab
 
 ### Bulk Import Workflow
-User provides merchants grouped by MCC in chat → I populate `runBulkImport()` array → user pastes Code.gs into Apps Script editor and runs `runBulkImport()` once. Re-running is safe — duplicate guard skips existing rows.
-
-### MCC Explorer API
-**Removed (Apr 2026).** `lookupMCCExplorer()` and `fetchMCCDatabase()` have been deleted from Code.gs — they did not reliably identify Singapore merchants and caused a `ReferenceError` on every run. Manual MCC lookup via `runBulkImport()` is the only approach.
-
-### Obscured Merchant Names (Pipeline To-Do)
-Some transactions produce dynamic/junk merchant strings that should not pollute the Merchants tab, e.g.:
-- `Grab* A-97FSUTLGWRTFAV Singapore SGP` — Grab ride with booking reference appended
-- `FP* XXXXXX` — FoodPanda order codes
-
-**Current behaviour:** `autoRegisterMerchant()` adds these as new rows with `Needs classification`.
-**Fix needed:** Add a pre-processing step to detect and strip dynamic suffixes before registration, OR add short matchKeys (e.g. `GRAB`, `FP*`) to the Merchants table so the substring match catches these variants before `autoRegisterMerchant()` fires.
-
----
-
-## Merchant Batch To-Do
-
-Batches done so far — MCC and eligibility auto-set by `mccToHsbcEligible()` / `mccToCitiOnline()`:
-
-| Batch | MCC | HSBC | Status |
-|-------|-----|------|--------|
-| Fast food chains (McDonald's, KFC, Burger King, etc. — 37 merchants) | 5814 | NO | ✅ Done |
-| Bubble tea (LiHO, Gong Cha, Tiger Sugar, Chatime, etc. — 12 merchants) | 5814 | NO | ✅ Done |
-| Cafes (Craftsmen, Daybreak, Devon Cafe, Killiney, etc. — 11 merchants) | 5814 | NO | ✅ Done |
-
-**Pending — awaiting user to provide MCC-grouped merchant lists:**
-
-- [ ] **MCC 5812** — Sit-down restaurants (Genki Sushi, Ichi-ban Boshi, Belgian Beer Cafe, Harbourfront Seafood, Spago, and the large 5812 list provided earlier — HSBC: YES)
-- [ ] **MCC 5712** — Furniture / home furnishings (Weavve Home, Castlery, IKEA, etc. — HSBC: YES via 5999 mapping TBC)
-- [ ] **MCC 5734** — Computer/software stores (Adobe, Shopee, Lazada, etc. — HSBC: YES via 5999 mapping TBC)
-- [ ] **Transport merchants** — Grab, Gojek (MCC 4121, HSBC YES) and SimplyGo (MCC 4111, HSBC NO); also fixes obscured Grab dynamic-code entries
-- [ ] **Obscured merchant name handling** — design and implement pre-processing filter for dynamic booking-reference suffixes (e.g. `Grab* A-97FSUTLGWRTFAV`)
+Paste merchant names into the `BulkImport` sheet tab (col A = name, col B = MCC, col C = category). Run `runSheetImport()` from the Apps Script editor once. Safe to re-run — duplicate guard skips existing rows.
 
 ## `doGet()` Endpoint
 Returns `{ transactions: [...] }` for `?action=transactions`. Also supports `?action=cap_usage` and `?action=card_config`. Optional `?month=Apr-2026` filter.
