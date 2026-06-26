@@ -14,7 +14,7 @@
 
 ### Citibank (`alerts@citibank.com.sg`)
 Use `\s+` between words in field-name regexes — Citi emails have inconsistent formatting.
-- **Card detection:** body is checked for `"Citi Cashback+"` (case-insensitive) to distinguish the two Citi cards. Card field is set to `CitiCashback+` or `CitiRewards` accordingly, and the correct reward calculator is called.
+- **Card detection:** body is checked with `/citi[\s\-]*cash[\s\-]*back\+/i` to distinguish the two Citi cards. Citi's actual email text is `"Citi Cash Back+ Card"` (space between "Cash" and "Back") — the regex handles both spaced and unspaced forms. Card field is set to `CitiCashback+` or `CitiRewards` accordingly, and the correct reward calculator is called.
 - Amaze: `^AMAZE\*` or `INSTAREM` prefix → strip prefix, `remarks = 'Via Amaze'`, card = `CitiRewards`
 - Date: `DD/MM/YY` → `parseCitiDate()` → stored as `DD/MMM/YYYY`
 
@@ -95,3 +95,11 @@ Paste merchant names into the `BulkImport` sheet tab (col A = name, col B = MCC,
 
 ## `doGet()` Endpoint
 Returns `{ transactions: [...] }` for `?action=transactions`. Also supports `?action=cap_usage` and `?action=card_config`. Optional `?month=Apr-2026` filter.
+
+## Deduplication and Gmail Quota
+
+### processedIds (Script Properties)
+Each successfully written message ID is stored in `PropertiesService` under `processedMsgIds`. `processEmails()` wraps all parser calls in `try-finally` so `saveProcessedIds()` is always called even if a Gmail quota error is thrown mid-run — this prevents duplicate rows on the next run.
+
+### Rolling date filter (`rollingDateFilter(days)`)
+All four Gmail search queries use `rollingDateFilter(30)` instead of a fixed `after:2026/04/01` date. This keeps the search window at a constant 30 days, preventing Gmail API quota from growing as the months pass. If you need to reprocess older emails, temporarily increase the window (e.g. `rollingDateFilter(90)`) and run once manually.

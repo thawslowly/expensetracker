@@ -9,9 +9,30 @@ var TAB_NAME        = 'Transactions';
 var MERCHANTS_TAB   = 'Merchants';
 var PROCESSED_LABEL = 'Bank-Processed';
 
+// How many days back each Gmail search looks. Processed-ID retention is kept
+// LONGER than this window so an email that is still searchable can never have
+// its ID forgotten (which would cause it to be re-written as a duplicate row).
+var ROLLING_WINDOW_DAYS      = 30;
+var PROCESSED_RETENTION_DAYS = 44;   // window + buffer
+
+// Foreign transactions are converted to SGD at processing time using a live
+// mid-market rate, then multiplied by FX_MARKUP to approximate the bank's
+// foreign-transaction fee (Visa/Mastercard charge ~3.25% on SGD cards).
+//   1.00   = pure mid-market (no markup)
+//   1.0325 = +3.25% (typical card FCY fee)  ← current setting
+var FX_MARKUP = 1.0325;
+
+// FX rates cached for this execution to avoid repeated API calls in one run.
+var _fxCache = {};
+
 // Module-level cache — loaded once per script execution, cleared when a new
 // merchant is added so the next lookup sees the updated table.
 var _merchantsCache = null;
+
+// Cached Spreadsheet handle — opening by ID is the slow part, so we open once
+// per execution instead of on every read/write. Re-set on each function entry
+// point is unnecessary: a fresh execution starts with this null.
+var _ss = null;
 
 
 // ── Column indices (1-based) ──────────────────────────────────
@@ -140,19 +161,35 @@ var POSB_SPC_6PCT        = ['SPC'];
 // ─────────────────────────────────────────────────────────────
 function processEmails() {
   var label = getOrCreateLabel(PROCESSED_LABEL);
-  // Load the set of already-processed Gmail message IDs once.
-  // This is the source of truth for deduplication — replaces starring.
   var processedIds = loadProcessedIds();
   var processed = 0;
 
-  processed += processCitiEmails(label, processedIds);
-  processed += processPOSBPayNowEmails(label, processedIds);
-  processed += processHSBCEmails(label, processedIds);
-  processed += processPOSBEverydayEmails(label, processedIds);
+  // try-finally guarantees processedIds is saved even if a Gmail quota error
+  // is thrown mid-run — prevents duplicate rows on the next successful run.
+  try {
+    processed += processCitiEmails(label, processedIds);
+    processed += processPOSBPayNowEmails(label, processedIds);
+    processed += processHSBCEmails(label, processedIds);
+    processed += processPOSBEverydayEmails(label, processedIds);
+  } finally {
+    saveProcessedIds(processedIds);
+  }
 
-  // Persist any newly-added IDs back to storage
-  saveProcessedIds(processedIds);
   Logger.log('Total rows written: ' + processed);
+}
+
+/**
+ * Returns a Gmail date filter string for the last N days, e.g. "after:2026/05/03".
+ * Using a rolling window instead of a fixed date keeps search result counts low as
+ * time passes, which reduces Gmail API quota consumption significantly.
+ */
+function rollingDateFilter(days) {
+  var d = new Date();
+  d.setDate(d.getDate() - days);
+  var y = d.getFullYear();
+  var m = String(d.getMonth() + 1).padStart ? String(d.getMonth() + 1).padStart(2, '0') : (d.getMonth() + 1 < 10 ? '0' : '') + (d.getMonth() + 1);
+  var day = String(d.getDate()).padStart ? String(d.getDate()).padStart(2, '0') : (d.getDate() < 10 ? '0' : '') + d.getDate();
+  return 'after:' + y + '/' + m + '/' + day;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -163,7 +200,7 @@ function processEmails() {
 function processCitiEmails(label, processedIds) {
   // Search all Citi threads (including already-labelled ones) so we can
   // process new messages that arrived after the thread was first labelled.
-  var query = 'from:alerts@citibank.com.sg subject:"Citi Alerts - Credit Card" after:2026/04/01';
+  var query = 'from:alerts@citibank.com.sg subject:"Citi Alerts - Credit Card" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -200,7 +237,7 @@ function processCitiEmails(label, processedIds) {
         Logger.log('Citi: could not parse email — skipping. Subject: ' + msg.getSubject());
         // Log first 400 chars of normalised body to help diagnose format changes
         Logger.log('Body (first 400 chars): ' + body.substring(0, 400));
-        processedIds[msg.getId()] = true; // mark as seen so we don't retry
+        markProcessed(processedIds, msg); // mark as seen so we don't retry
         continue;
       }
 
@@ -223,20 +260,25 @@ function processCitiEmails(label, processedIds) {
       context = context.replace(/\s+[A-Z]{3}$/, '').trim();
       context = normalizeContext(context);
 
-      // Detect card type from email body ("Citi Cashback+ Card" vs "Citi Rewards Card")
-      var isCashbackCard = /citi\s*cashback\+/i.test(body);
+      // Detect card type from email body.
+      // Citi emails write "Citi Cash Back+ Card" (with space), so match both forms.
+      var isCashbackCard = /citi[\s\-]*cash[\s\-]*back\+/i.test(body);
       var card     = isCashbackCard ? 'CitiCashback+' : 'CitiRewards';
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
       var category = guessCategory(context);
-      var remarks  = isAmaze ? 'Via Amaze' : '';
+      // ── Convert foreign amounts to SGD ──────────────────
+      // Reward logic still uses the ORIGINAL currency (for FCY labelling), but
+      // the recorded amount and reward maths use the converted SGD value.
+      var conv     = toSGD(amount, currency);
+      var remarks  = joinRemarks(isAmaze ? 'Via Amaze' : '', conv.remark);
 
       // ── Reward calculation ──────────────────────────────
       var reward   = isCashbackCard
-        ? calcCitiCashbackReward(amount)
-        : calcCitiReward(context, currency, amount, isAmaze);
+        ? calcCitiCashbackReward(conv.amount)
+        : calcCitiReward(context, currency, conv.amount, isAmaze);
 
-      var row = buildRow(txnDate, amount, category, displayContext, card, currency,
+      var row = buildRow(txnDate, conv.amount, category, displayContext, card, conv.currency,
                          reward.bonusEligible, reward.rate, reward.estReward, remarks);
 
       var written = writeRow(row);
@@ -244,7 +286,7 @@ function processCitiEmails(label, processedIds) {
         Logger.log('Citi: write failed — will retry on next run. Detail: ' + rawDetail);
         continue; // leave message untracked so next run retries it
       }
-      processedIds[msg.getId()] = true; // mark this individual message as processed
+      markProcessed(processedIds, msg); // mark this individual message as processed
       msg.markRead();
       count++;
       wroteAny = true;
@@ -265,7 +307,7 @@ function processCitiEmails(label, processedIds) {
 // ─────────────────────────────────────────────────────────────
 function processPOSBPayNowEmails(label, processedIds) {
   // DBS sends PayNow confirmations under two subject lines — search both.
-  var query = 'from:ibanking.alert@dbs.com (subject:PayNow OR subject:"iBanking Alerts") after:2026/04/01';
+  var query = 'from:ibanking.alert@dbs.com (subject:PayNow OR subject:"iBanking Alerts") ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -286,7 +328,7 @@ function processPOSBPayNowEmails(label, processedIds) {
       // capturing other DBS alert types that share the same subject line.
       if (body.toUpperCase().indexOf('PAYNOW') === -1) {
         Logger.log('POSB PayNow: email skipped — body does not mention PAYNOW. Subject: ' + msg.getSubject());
-        processedIds[msg.getId()] = true;
+        markProcessed(processedIds, msg);
         continue;
       }
 
@@ -298,7 +340,7 @@ function processPOSBPayNowEmails(label, processedIds) {
 
       if (!amtMatch) {
         Logger.log('POSB PayNow: could not parse amount — skipping.');
-        processedIds[msg.getId()] = true;
+        markProcessed(processedIds, msg);
         continue;
       }
 
@@ -315,7 +357,7 @@ function processPOSBPayNowEmails(label, processedIds) {
         Logger.log('POSB PayNow: write failed — will retry on next run. Recipient: ' + recipient);
         continue; // leave message untracked so next run retries it
       }
-      processedIds[msg.getId()] = true;
+      markProcessed(processedIds, msg);
       msg.markRead();
       count++;
       wroteAny = true;
@@ -336,7 +378,7 @@ function processPOSBPayNowEmails(label, processedIds) {
 // separate lines (no colon), so regex uses \s+ between them.
 // ─────────────────────────────────────────────────────────────
 function processHSBCEmails(label, processedIds) {
-  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01';
+  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -366,7 +408,7 @@ function processHSBCEmails(label, processedIds) {
       if (!txnAmtMatch || !descMatch) {
         Logger.log('HSBC: could not parse email — skipping. Subject: ' + msg.getSubject());
         Logger.log('HSBC body (first 800 chars):\n' + body.substring(0, 800));
-        processedIds[msg.getId()] = true; // prevent infinite retries
+        markProcessed(processedIds, msg); // prevent infinite retries
         continue;
       }
 
@@ -379,17 +421,20 @@ function processHSBCEmails(label, processedIds) {
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
       var category = guessCategory(context);
-      var reward   = calcHSBCReward(context, currency, amount);
 
-      var row = buildRow(txnDate, amount, category, displayContext, card, currency,
-                         reward.bonusEligible, reward.rate, reward.estReward, '');
+      // Convert foreign amounts to SGD; reward maths uses the SGD value.
+      var conv     = toSGD(amount, currency);
+      var reward   = calcHSBCReward(context, currency, conv.amount);
+
+      var row = buildRow(txnDate, conv.amount, category, displayContext, card, conv.currency,
+                         reward.bonusEligible, reward.rate, reward.estReward, conv.remark);
 
       var written = writeRow(row);
       if (!written) {
         Logger.log('HSBC: write failed — will retry. Description: ' + context);
         continue;
       }
-      processedIds[msg.getId()] = true;
+      markProcessed(processedIds, msg);
       msg.markRead();
       count++;
       wroteAny = true;
@@ -409,7 +454,7 @@ function processHSBCEmails(label, processedIds) {
 // Only processes transactions for card ending 9299.
 // ─────────────────────────────────────────────────────────────
 function processPOSBEverydayEmails(label, processedIds) {
-  var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" after:2026/04/01';
+  var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -426,7 +471,7 @@ function processPOSBEverydayEmails(label, processedIds) {
 
       // Only process transactions from card ending 9299
       if (body.indexOf('9299') === -1) {
-        processedIds[msg.getId()] = true; // not our card — mark seen and skip
+        markProcessed(processedIds, msg); // not our card — mark seen and skip
         continue;
       }
 
@@ -436,7 +481,7 @@ function processPOSBEverydayEmails(label, processedIds) {
 
       if (!amtMatch) {
         Logger.log('POSB Everyday: could not parse amount — skipping.');
-        processedIds[msg.getId()] = true;
+        markProcessed(processedIds, msg);
         continue;
       }
 
@@ -451,17 +496,23 @@ function processPOSBEverydayEmails(label, processedIds) {
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
       var category = guessCategory(context);
-      var reward   = calcPOSBEverydayReward(context, currency, amount);
 
-      var row = buildRow(txnDate, amount, category, displayContext, 'POSB Everyday', currency,
-                         reward.bonusEligible, reward.rate, reward.estReward, reward.remark);
+      // Convert to SGD. The reward calculator still receives the ORIGINAL
+      // currency so the MYR 10% tier (Malaysia spend) is detected correctly,
+      // but the cashback maths and recorded amount use the converted SGD value.
+      var conv     = toSGD(amount, currency);
+      var reward   = calcPOSBEverydayReward(context, currency, conv.amount);
+      var remarks  = joinRemarks(reward.remark, conv.remark);
+
+      var row = buildRow(txnDate, conv.amount, category, displayContext, 'POSB Everyday', conv.currency,
+                         reward.bonusEligible, reward.rate, reward.estReward, remarks);
 
       var written = writeRow(row);
       if (!written) {
         Logger.log('POSB Everyday: write failed — will retry. Merchant: ' + context);
         continue;
       }
-      processedIds[msg.getId()] = true;
+      markProcessed(processedIds, msg);
       msg.markRead();
       count++;
       wroteAny = true;
@@ -488,11 +539,13 @@ function calcCitiReward(merchant, currency, amount, isAmaze) {
   // Miles rounded down to nearest SGD1 per T&C clause 13
   var wholeAmt = Math.floor(amount);
 
+  // FCY note — for non-SGD spend the estimate uses the foreign amount as if it
+  // were SGD (we have no FX rate from the email), so flag it as approximate.
+  var fcyNote = (currency !== 'SGD') ? ' (FCY est.)' : '';
+
   // Step 1: Hard exclusions (travel MCCs, mobile wallets) — always base rate
-  for (var i = 0; i < CITI_EXCLUDE_KEYWORDS.length; i++) {
-    if (upper.indexOf(CITI_EXCLUDE_KEYWORDS[i]) !== -1) {
-      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
-    }
+  if (matchesAny(upper, CITI_EXCLUDE_KEYWORDS)) {
+    return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
   }
 
   // Step 2: Via Amaze — Amaze re-codes any merchant as online MCC → 4 mpd
@@ -508,17 +561,15 @@ function calcCitiReward(merchant, currency, amount, isAmaze) {
   // Step 3: Merchants table — definitive YES/NO overrides keyword guessing
   var record = lookupMerchant(merchant);
   if (record && record.citiOnline === 'YES') {
-    return { bonusEligible: 'YES', rate: '4 mpd (online)', estReward: round2(wholeAmt * 4) };
+    return { bonusEligible: 'YES', rate: '4 mpd (online)' + fcyNote, estReward: round2(wholeAmt * 4) };
   }
   if (record && record.citiOnline === 'NO') {
     return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
   }
 
   // Step 4: Confirmed-online keyword fallback — earn 4 mpd (online retail per T&C)
-  for (var j = 0; j < CITI_ONLINE_KEYWORDS.length; j++) {
-    if (upper.indexOf(CITI_ONLINE_KEYWORDS[j]) !== -1) {
-      return { bonusEligible: 'YES', rate: '4 mpd (online)', estReward: round2(wholeAmt * 4) };
-    }
+  if (matchesAny(upper, CITI_ONLINE_KEYWORDS)) {
+    return { bonusEligible: 'YES', rate: '4 mpd (online)' + fcyNote, estReward: round2(wholeAmt * 4) };
   }
 
   // Step 5: Everything else (physical dining, groceries, transport etc.) → base 0.4 mpd
@@ -530,27 +581,26 @@ function calcHSBCReward(merchant, currency, amount) {
   var upper    = merchant.toUpperCase();
   var wholeAmt = Math.floor(amount);  // miles rounded down to nearest SGD1 per T&C clause 8
 
+  // FCY note — non-SGD estimate uses the foreign amount as if SGD (no FX rate).
+  var fcyNote = (currency !== 'SGD') ? ' (FCY est.)' : '';
+
   // Step 1: Exclusions (fast food, food delivery, OTAs, transit) — always base rate
-  for (var i = 0; i < HSBC_EXCLUDE_KEYWORDS.length; i++) {
-    if (upper.indexOf(HSBC_EXCLUDE_KEYWORDS[i]) !== -1) {
-      return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
-    }
+  if (matchesAny(upper, HSBC_EXCLUDE_KEYWORDS)) {
+    return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
   }
 
   // Step 2: Merchants table — definitive YES/NO overrides keyword guessing
   var record = lookupMerchant(merchant);
   if (record && record.hsbcEligible === 'YES') {
-    return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(wholeAmt * 4) };
+    return { bonusEligible: 'YES', rate: '4 mpd' + fcyNote, estReward: round2(wholeAmt * 4) };
   }
   if (record && record.hsbcEligible === 'NO') {
     return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
   }
 
   // Step 3: Bonus keyword fallback — earn 4 mpd (both contactless + online, restored Apr 2026)
-  for (var j = 0; j < HSBC_BONUS_KEYWORDS.length; j++) {
-    if (upper.indexOf(HSBC_BONUS_KEYWORDS[j]) !== -1) {
-      return { bonusEligible: 'YES', rate: '4 mpd', estReward: round2(wholeAmt * 4) };
-    }
+  if (matchesAny(upper, HSBC_BONUS_KEYWORDS)) {
+    return { bonusEligible: 'YES', rate: '4 mpd' + fcyNote, estReward: round2(wholeAmt * 4) };
   }
 
   // Step 4: Everything else — 0.4 mpd base
@@ -559,7 +609,6 @@ function calcHSBCReward(merchant, currency, amount) {
 
 function calcPOSBEverydayReward(merchant, currency, amount) {
   var upper = merchant.toUpperCase();
-  var k, found;
 
   // MYR in-store: 10% (needs $800 min spend)
   if (currency === 'MYR') {
@@ -567,60 +616,38 @@ function calcPOSBEverydayReward(merchant, currency, amount) {
   }
 
   // Food delivery: 10% (needs $800 min spend)
-  for (k = 0; k < POSB_DELIVERY_10PCT.length; k++) {
-    if (upper.indexOf(POSB_DELIVERY_10PCT[k]) !== -1) {
-      return { bonusEligible: '\u26a0\ufe0f', rate: '10% delivery', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
-    }
+  if (matchesAny(upper, POSB_DELIVERY_10PCT)) {
+    return { bonusEligible: '\u26a0\ufe0f', rate: '10% delivery', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
   }
 
   // Transit (SimplyGo / BUS/MRT): 10% (needs $800 min spend)
-  for (k = 0; k < POSB_TRANSIT_10PCT.length; k++) {
-    if (upper.indexOf(POSB_TRANSIT_10PCT[k]) !== -1) {
-      return { bonusEligible: '\u26a0\ufe0f', rate: '10% transit', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
-    }
-  }
-
-  // Check fast food exclusion before dining bonus
-  found = false;
-  for (k = 0; k < POSB_DINING_EXCL.length; k++) {
-    if (upper.indexOf(POSB_DINING_EXCL[k]) !== -1) { found = true; break; }
+  if (matchesAny(upper, POSB_TRANSIT_10PCT)) {
+    return { bonusEligible: '\u26a0\ufe0f', rate: '10% transit', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
   }
 
   // Dining 5% — excludes fast food (needs $800 min spend)
-  if (!found) {
-    for (k = 0; k < POSB_DINING_5PCT.length; k++) {
-      if (upper.indexOf(POSB_DINING_5PCT[k]) !== -1) {
-        return { bonusEligible: '\u26a0\ufe0f', rate: '5% dining', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
-      }
-    }
+  if (!matchesAny(upper, POSB_DINING_EXCL) && matchesAny(upper, POSB_DINING_5PCT)) {
+    return { bonusEligible: '\u26a0\ufe0f', rate: '5% dining', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
   }
 
   // Online shopping 5% (needs $800 min spend)
-  for (k = 0; k < POSB_SHOPPING_5PCT.length; k++) {
-    if (upper.indexOf(POSB_SHOPPING_5PCT[k]) !== -1) {
-      return { bonusEligible: '\u26a0\ufe0f', rate: '5% online', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
-    }
+  if (matchesAny(upper, POSB_SHOPPING_5PCT)) {
+    return { bonusEligible: '\u26a0\ufe0f', rate: '5% online', estReward: round2(amount * 0.05), remark: 'Needs $800 min spend' };
   }
 
   // Sheng Siong 5% — no min spend required
-  for (k = 0; k < POSB_SHENGSIONG_5PCT.length; k++) {
-    if (upper.indexOf(POSB_SHENGSIONG_5PCT[k]) !== -1) {
-      return { bonusEligible: 'YES', rate: '5% supermarket', estReward: round2(amount * 0.05), remark: '' };
-    }
+  if (matchesAny(upper, POSB_SHENGSIONG_5PCT)) {
+    return { bonusEligible: 'YES', rate: '5% supermarket', estReward: round2(amount * 0.05), remark: '' };
   }
 
   // Watsons 3% — no min spend required
-  for (k = 0; k < POSB_WATSONS_3PCT.length; k++) {
-    if (upper.indexOf(POSB_WATSONS_3PCT[k]) !== -1) {
-      return { bonusEligible: 'YES', rate: '3% Watsons', estReward: round2(amount * 0.03), remark: '' };
-    }
+  if (matchesAny(upper, POSB_WATSONS_3PCT)) {
+    return { bonusEligible: 'YES', rate: '3% Watsons', estReward: round2(amount * 0.03), remark: '' };
   }
 
   // SPC 6% — no min spend required
-  for (k = 0; k < POSB_SPC_6PCT.length; k++) {
-    if (upper.indexOf(POSB_SPC_6PCT[k]) !== -1) {
-      return { bonusEligible: 'YES', rate: '6% fuel', estReward: round2(amount * 0.06), remark: '' };
-    }
+  if (matchesAny(upper, POSB_SPC_6PCT)) {
+    return { bonusEligible: 'YES', rate: '6% fuel', estReward: round2(amount * 0.06), remark: '' };
   }
 
   // Base rate 0.3% — always applicable
@@ -638,7 +665,7 @@ function calcPOSBEverydayReward(merchant, currency, amount) {
  */
 function getMerchantsTable() {
   if (_merchantsCache) return _merchantsCache;
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName(MERCHANTS_TAB);
   if (!sheet) return (_merchantsCache = []);
   var rows = sheet.getDataRange().getValues();
@@ -739,7 +766,7 @@ function addMerchantToTable(matchKey, displayName, category, hsbcEligible, citiO
     Logger.log('addMerchantToTable: "' + matchKey + '" already exists — skipping');
     return;
   }
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName(MERCHANTS_TAB);
   if (!sheet) {
     Logger.log('addMerchantToTable: Merchants tab not found — skipping');
@@ -800,6 +827,28 @@ function normalizeContext(context) {
   return context;
 }
 
+/**
+ * True if `keyword` appears in `haystack` at a word start, e.g. "APPLE" matches
+ * "APPLE.COM" and "APPLE PAY" but NOT "PINEAPPLE". A plain indexOf would match
+ * the latter and wrongly classify it. We anchor the START only (a leading \b),
+ * not the end, so prefix-style keywords still work: "MCDONALD" matches
+ * "MCDONALDS". Keywords beginning with a non-word char (e.g. "FP*") get no
+ * anchor and fall back to a plain substring match.
+ */
+function containsKeyword(haystack, keyword) {
+  var escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  var lead = /^\w/.test(keyword) ? '\\b' : '';
+  return new RegExp(lead + escaped, 'i').test(haystack);
+}
+
+// True if any keyword in the list matches the merchant string.
+function matchesAny(haystack, keywords) {
+  for (var i = 0; i < keywords.length; i++) {
+    if (containsKeyword(haystack, keywords[i])) return true;
+  }
+  return false;
+}
+
 function guessCategory(merchant) {
   // 1. Check the Merchants table first — allows per-merchant overrides
   var record = lookupMerchant(merchant);
@@ -808,10 +857,7 @@ function guessCategory(merchant) {
   // 2. Fall back to hardcoded keyword map
   var upper = merchant.toUpperCase();
   for (var cat in CATEGORY_KEYWORDS) {
-    var keywords = CATEGORY_KEYWORDS[cat];
-    for (var i = 0; i < keywords.length; i++) {
-      if (upper.indexOf(keywords[i]) !== -1) return cat;
-    }
+    if (matchesAny(upper, CATEGORY_KEYWORDS[cat])) return cat;
   }
   return '\u26a0\ufe0f REVIEW';
 }
@@ -832,7 +878,8 @@ function resolveContext(rawMerchant) {
  * Safe to call on every transaction — skips silently if merchant already exists.
  */
 function autoRegisterMerchant(rawMerchant) {
-  if (lookupMerchant(rawMerchant)) return; // already known
+  if (!rawMerchant || !rawMerchant.trim()) return; // nothing to register — avoids blank rows
+  if (lookupMerchant(rawMerchant)) return;         // already known
 
   addMerchantToTable(
     rawMerchant,        // matchKey — uppercased inside addMerchantToTable()
@@ -869,7 +916,7 @@ function autoRegisterMerchant(rawMerchant) {
  * To import a new MCC batch: update col A & B in the BulkImport tab, re-run.
  */
 function runSheetImport() {
-  var ss          = SpreadsheetApp.openById(SHEET_ID);
+  var ss          = getSpreadsheet();
   var importSheet = ss.getSheetByName('BulkImport');
   if (!importSheet) {
     Logger.log('runSheetImport: BulkImport tab not found. Run setupBulkImportTab() first.');
@@ -916,7 +963,7 @@ function runSheetImport() {
  * Run this once, then paste merchant names into col A and the MCC into col B.
  */
 function setupBulkImportTab() {
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName('BulkImport');
   if (sheet) {
     Logger.log('setupBulkImportTab: tab already exists — nothing to do');
@@ -943,7 +990,7 @@ function buildRow(date, amount, category, context, card, currency,
 
 function writeRow(row) {
   try {
-    var ss    = SpreadsheetApp.openById(SHEET_ID);
+    var ss    = getSpreadsheet();
     var sheet = ss.getSheetByName(TAB_NAME);
     if (!sheet) {
       Logger.log('ERROR: Sheet tab "' + TAB_NAME + '" not found!');
@@ -964,21 +1011,39 @@ function getOrCreateLabel(name) {
   return label;
 }
 
+// Whole-day number since the Unix epoch (used to age out processed IDs).
+function epochDay(date) {
+  return Math.floor(date.getTime() / 86400000);
+}
+
 /**
- * Load the set of already-processed Gmail message IDs from Script Properties.
- * Returns a plain object used as a hash set: { messageId: true, ... }
- * This replaces the "star as sentinel" approach so that:
- *   1. Stars remain free for the user's own bookmarking.
- *   2. Threaded emails (multiple transactions in one thread) are correctly
- *      deduplicated — each message ID is tracked individually.
+ * Record a message as processed, storing the DAY of the email (not "true").
+ * Storing the day lets saveProcessedIds() prune by age rather than by a blind
+ * count, which is what guarantees an email still inside the search window is
+ * never forgotten and re-written as a duplicate.
+ */
+function markProcessed(processedIds, msg) {
+  processedIds[msg.getId()] = epochDay(msg.getDate());
+}
+
+/**
+ * Load the map of already-processed Gmail message IDs from Script Properties.
+ * Returns { messageId: epochDay, ... }. Backward-compatible with the old format
+ * (a plain JSON array of IDs) — those are imported as "seen today".
  */
 function loadProcessedIds() {
   var raw = PropertiesService.getScriptProperties().getProperty('processedMsgIds');
   if (!raw) return {};
   try {
-    var arr = JSON.parse(raw);
+    var parsed = JSON.parse(raw);
     var map = {};
-    for (var i = 0; i < arr.length; i++) map[arr[i]] = true;
+    if (Array.isArray(parsed)) {
+      // Legacy format: array of IDs with no dates — keep them, dated today.
+      var today = epochDay(new Date());
+      for (var i = 0; i < parsed.length; i++) map[parsed[i]] = today;
+    } else {
+      map = parsed; // new format: { id: epochDay }
+    }
     return map;
   } catch (e) {
     Logger.log('loadProcessedIds: parse error, resetting. ' + e);
@@ -987,20 +1052,40 @@ function loadProcessedIds() {
 }
 
 /**
- * Persist the processed-ID set back to Script Properties.
- * Keeps only the most recent 400 IDs to stay within the 9 KB property limit.
- * Older IDs beyond this window are pruned — safe because emails that old
- * would already have been labelled Bank-Processed and won't be written again.
+ * Persist the processed-ID map back to Script Properties.
+ * Prunes any ID older than PROCESSED_RETENTION_DAYS — safe because an email
+ * that old is already outside the ROLLING_WINDOW_DAYS search window, so it can
+ * never be re-found and re-written. Retention > search window is the actual
+ * guard against duplicate rows.
+ *
+ * A hard count cap (MAX_IDS) is kept only as a 9 KB property-size safety net;
+ * it would only ever trigger above ~10 transactions/day sustained.
  */
 function saveProcessedIds(map) {
-  var arr = Object.keys(map);
-  // If over the cap, drop from the front (oldest additions first).
-  // Because we add to the set in order of processing, the front of the
-  // key list tends to be the oldest, but this is best-effort — the real
-  // guard against duplicates is the Bank-Processed label on the thread.
-  var MAX_IDS = 400;
-  if (arr.length > MAX_IDS) arr = arr.slice(arr.length - MAX_IDS);
-  PropertiesService.getScriptProperties().setProperty('processedMsgIds', JSON.stringify(arr));
+  var nowDay = epochDay(new Date());
+  var cutoff = nowDay - PROCESSED_RETENTION_DAYS;
+
+  var kept = {};
+  var keys = Object.keys(map);
+  for (var i = 0; i < keys.length; i++) {
+    var day = map[keys[i]];
+    if (typeof day !== 'number') day = nowDay; // legacy "true" → treat as today
+    if (day >= cutoff) kept[keys[i]] = day;
+  }
+
+  // Safety net against the 9 KB property limit: keep the newest by day.
+  var keptKeys = Object.keys(kept);
+  var MAX_IDS = 450;
+  if (keptKeys.length > MAX_IDS) {
+    keptKeys.sort(function(a, b) { return kept[a] - kept[b]; }); // oldest first
+    var trimmed = {};
+    for (var k = keptKeys.length - MAX_IDS; k < keptKeys.length; k++) {
+      trimmed[keptKeys[k]] = kept[keptKeys[k]];
+    }
+    kept = trimmed;
+  }
+
+  PropertiesService.getScriptProperties().setProperty('processedMsgIds', JSON.stringify(kept));
 }
 
 // Parse "DD/MM/YY" (Citi format) → Date
@@ -1012,9 +1097,28 @@ function parseCitiDate(str) {
   return new Date(year, month, day);
 }
 
-// Parse "09 Apr 2026" (DBS PayNow format) → Date
+/**
+ * Guards against two date-parsing hazards:
+ *  1. A date with no year (V8 defaults missing years to 2001).
+ *  2. Year rollover — e.g. a 31 Dec transaction processed on 1 Jan would
+ *     otherwise be stamped with the new year. If the result lands more than
+ *     2 days in the future, roll it back a year.
+ */
+function withYearGuard(date) {
+  if (isNaN(date.getTime())) return new Date();
+  var now = new Date();
+  if (date.getTime() - now.getTime() > 2 * 86400000) {
+    date.setFullYear(date.getFullYear() - 1);
+  }
+  return date;
+}
+
+// Parse "13 Apr" (DBS PayNow format — no year in the email) → Date.
+// The previous version did new Date("13 Apr"), which V8 dates to the year 2001.
 function parseDBSDate(str) {
-  return new Date(str);
+  var m = str.match(/(\d{1,2})\s+([A-Za-z]{3})/);
+  if (!m) return new Date();
+  return withYearGuard(new Date(m[1] + ' ' + m[2] + ' ' + new Date().getFullYear()));
 }
 
 // Parse "11/APR/2026" (HSBC format) → Date
@@ -1030,7 +1134,7 @@ function parseHSBCDate(str) {
 function parsePOSBCardDate(str) {
   var match = str.match(/(\d{1,2})\s+([A-Za-z]{3})/);
   if (!match) return new Date();
-  return new Date(match[1] + ' ' + match[2] + ' ' + new Date().getFullYear());
+  return withYearGuard(new Date(match[1] + ' ' + match[2] + ' ' + new Date().getFullYear()));
 }
 
 // Format Date → "07/Apr/2026"
@@ -1054,6 +1158,85 @@ function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
+// Open the spreadsheet once per execution. openById() is the slow Apps Script
+// call, so caching the handle avoids re-opening on every row read/write.
+function getSpreadsheet() {
+  if (!_ss) _ss = SpreadsheetApp.openById(SHEET_ID);
+  return _ss;
+}
+
+/**
+ * Fetch how many SGD one unit of `currency` is worth (live mid-market rate).
+ * Source: open.er-api.com — free, no API key, ~160 currencies (covers JPY, USD,
+ * MYR, THB, TWD, VND etc.). Returns null if the lookup fails so callers can
+ * leave the amount unconverted and flag it for review.
+ *
+ * Rates are cached for this run (_fxCache) and for 6 hours across runs
+ * (CacheService) so we don't hit the API on every transaction.
+ */
+function getFxRate(currency) {
+  if (_fxCache[currency] != null) return _fxCache[currency];
+
+  var cache  = CacheService.getScriptCache();
+  var cached = cache.get('fx_' + currency);
+  if (cached) { _fxCache[currency] = parseFloat(cached); return _fxCache[currency]; }
+
+  try {
+    var url  = 'https://open.er-api.com/v6/latest/' + encodeURIComponent(currency);
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) {
+      Logger.log('getFxRate: HTTP ' + resp.getResponseCode() + ' for ' + currency);
+      return null;
+    }
+    var data = JSON.parse(resp.getContentText());
+    if (!data || data.result !== 'success' || !data.rates || !data.rates.SGD) {
+      Logger.log('getFxRate: no SGD rate for ' + currency);
+      return null;
+    }
+    var rate = data.rates.SGD;
+    _fxCache[currency] = rate;
+    cache.put('fx_' + currency, String(rate), 6 * 3600); // cache 6 hours
+    return rate;
+  } catch (e) {
+    Logger.log('getFxRate error for ' + currency + ': ' + e);
+    return null;
+  }
+}
+
+/**
+ * Convert a foreign amount to SGD (mid-market rate × FX_MARKUP).
+ * Returns { amount, currency, remark }:
+ *   - success  → SGD amount, currency 'SGD', remark records the original.
+ *   - SGD in   → unchanged, no remark.
+ *   - failure  → original amount/currency kept, remark flags it for review.
+ */
+function toSGD(amount, currency) {
+  if (!currency || currency === 'SGD') {
+    return { amount: amount, currency: 'SGD', remark: '' };
+  }
+
+  var rate = getFxRate(currency);
+  if (!rate) {
+    return {
+      amount: amount,
+      currency: currency,
+      remark: 'REVIEW: FX rate unavailable for ' + currency + ' - amount NOT converted'
+    };
+  }
+
+  var sgd       = round2(amount * rate * FX_MARKUP);
+  var markupPct = round2((FX_MARKUP - 1) * 100);
+  var remark    = 'Orig ' + currency + ' ' + amount + ' @ ' + rate.toFixed(4) +
+                  (markupPct ? ' +' + markupPct + '%' : '');
+  return { amount: sgd, currency: 'SGD', remark: remark };
+}
+
+// Merge a base remark with the FX conversion note (either may be empty).
+function joinRemarks(base, fxRemark) {
+  if (base && fxRemark) return base + ' | ' + fxRemark;
+  return base || fxRemark || '';
+}
+
 // ─────────────────────────────────────────────────────────────
 // ONE-TIME SETUP — run manually from the Apps Script editor
 // ─────────────────────────────────────────────────────────────
@@ -1063,7 +1246,7 @@ function round2(n) {
  * Run once from the Apps Script editor: select setupMerchantsTab → Run.
  */
 function setupMerchantsTab() {
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName(MERCHANTS_TAB);
 
   if (sheet) {
@@ -1125,7 +1308,7 @@ function seedMerchantsTab() {
     'POSB Savings':    true
   };
 
-  var ss       = SpreadsheetApp.openById(SHEET_ID);
+  var ss       = getSpreadsheet();
   var txnSheet = ss.getSheetByName(TAB_NAME);
   var mchSheet = ss.getSheetByName(MERCHANTS_TAB);
 
@@ -1199,7 +1382,7 @@ function listUnknownMerchants() {
     'POSB Savings':   true   // PayNow — still auto-captured, though always ⚠️ REVIEW
   };
 
-  var ss        = SpreadsheetApp.openById(SHEET_ID);
+  var ss        = getSpreadsheet();
   var txnSheet  = ss.getSheetByName(TAB_NAME);
   var txnRows   = txnSheet.getDataRange().getValues();
   var merchants = getMerchantsTable();
@@ -1263,7 +1446,7 @@ function doGet(e) {
 }
 
 function getTransactions(params) {
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName(TAB_NAME);
   var rows  = sheet.getDataRange().getValues();
   var headers = rows[0];
@@ -1294,7 +1477,15 @@ function getTransactions(params) {
 }
 
 function getCapUsage(params) {
-  var txns = getTransactions(params);
+  // Caps are a per-month figure. If no month is requested, default to the
+  // current month — otherwise getTransactions() returns all history and the
+  // cap usage would be summed across every month ever recorded.
+  // NOTE: this groups by calendar month (MonthKey). Citi's cap actually resets
+  // on the statement month (~19th), so Citi usage is approximate near month-end.
+  var capParams = params || {};
+  if (!capParams.month) capParams = { month: formatMonthKey(new Date()) };
+
+  var txns = getTransactions(capParams);
   var usage = {
     CitiRewards:    { bonusSpend: 0, cap: 1000 },
     HSBCRevolution: { bonusSpend: 0, cap: 1000 }
@@ -1435,7 +1626,7 @@ function debugHSBCBody() {
  * Run this ONCE after deploying the regex fix, then run processEmails().
  */
 function resetHSBCProcessedIds() {
-  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" after:2026/04/01';
+  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
   var threads = GmailApp.search(query);
   var processedIds = loadProcessedIds();
   var removed = 0;
@@ -1563,7 +1754,7 @@ function testPOSBEverydayParse() {
  * Check the Execution Log after running — it will say PASS or FAIL.
  */
 function testMerchantsTabWrite() {
-  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var ss    = getSpreadsheet();
   var sheet = ss.getSheetByName(MERCHANTS_TAB);
 
   if (!sheet) {
@@ -1606,4 +1797,22 @@ function testWriteRow() {
   Logger.log('Attempting to write: ' + JSON.stringify(row));
   writeRow(row);
   Logger.log('Done.');
+}
+
+/**
+ * Confirms the FX conversion works AND that the external-request permission is
+ * granted. Run this from the editor:
+ *   - If a "Authorization required" prompt appears → approve it (this is the
+ *     permission you were expecting). Run again afterwards.
+ *   - If it logs live rates and converted amounts → permission is already
+ *     granted and the FX feature is working.
+ *   - If it errors that getFxRate/toSGD is "not defined" → the new code is NOT
+ *     saved in the editor yet; paste Code.gs in, Save (Ctrl+S), and re-run.
+ */
+function testFx() {
+  Logger.log('USD->SGD rate: ' + getFxRate('USD'));
+  Logger.log('JPY->SGD rate: ' + getFxRate('JPY'));
+  Logger.log('Convert JPY 10000: ' + JSON.stringify(toSGD(10000, 'JPY')));
+  Logger.log('Convert USD 100: '   + JSON.stringify(toSGD(100, 'USD')));
+  Logger.log('Convert SGD 50: '     + JSON.stringify(toSGD(50, 'SGD')));
 }
