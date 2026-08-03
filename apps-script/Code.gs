@@ -15,6 +15,11 @@ var PROCESSED_LABEL = 'Bank-Processed';
 var ROLLING_WINDOW_DAYS      = 30;
 var PROCESSED_RETENTION_DAYS = 44;   // window + buffer
 
+// Most 5-minute runs only need to see the last couple of days of email; a
+// full ROLLING_WINDOW_DAYS sweep still runs once an hour as a safety net for
+// late-delivered mail. Cuts Gmail read quota ~10x without losing anything.
+var QUICK_SCAN_DAYS = 2;
+
 // Foreign transactions are converted to SGD at processing time using a live
 // mid-market rate, then multiplied by FX_MARKUP to approximate the bank's
 // foreign-transaction fee (Visa/Mastercard charge ~3.25% on SGD cards).
@@ -160,22 +165,43 @@ var POSB_SPC_6PCT        = ['SPC'];
 // MAIN TRIGGER — runs every 5 minutes
 // ─────────────────────────────────────────────────────────────
 function processEmails() {
-  var label = getOrCreateLabel(PROCESSED_LABEL);
-  var processedIds = loadProcessedIds();
-  var processed = 0;
-
-  // try-finally guarantees processedIds is saved even if a Gmail quota error
-  // is thrown mid-run — prevents duplicate rows on the next successful run.
-  try {
-    processed += processCitiEmails(label, processedIds);
-    processed += processPOSBPayNowEmails(label, processedIds);
-    processed += processHSBCEmails(label, processedIds);
-    processed += processPOSBEverydayEmails(label, processedIds);
-  } finally {
-    saveProcessedIds(processedIds);
+  // Without a lock, a slow run overlapping the next 5-minute trigger means two
+  // executions load the same processed-ID map and write every in-flight email
+  // twice — the exact duplicate-row failure the ID store exists to prevent.
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30 * 1000)) {
+    Logger.log('processEmails: another run still active — skipping');
+    return;
   }
 
-  Logger.log('Total rows written: ' + processed);
+  try {
+    var label = getOrCreateLabel(PROCESSED_LABEL);
+    var processedIds = loadProcessedIds();
+    var processed = 0;
+
+    // Hourly full sweep; quick scan on the other runs (see QUICK_SCAN_DAYS).
+    var searchDays = (new Date().getMinutes() < 5) ? ROLLING_WINDOW_DAYS : QUICK_SCAN_DAYS;
+
+    // The finally save covers thrown errors (e.g. Gmail quota), but Apps
+    // Script's hard 6-minute kill does NOT run finally blocks — that case is
+    // covered by the per-parser saves here plus the periodic save inside
+    // markProcessed(), so a timeout can only lose the last few marks.
+    try {
+      processed += processCitiEmails(label, processedIds, searchDays);
+      saveProcessedIds(processedIds);
+      processed += processPOSBPayNowEmails(label, processedIds, searchDays);
+      saveProcessedIds(processedIds);
+      processed += processHSBCEmails(label, processedIds, searchDays);
+      saveProcessedIds(processedIds);
+      processed += processPOSBEverydayEmails(label, processedIds, searchDays);
+    } finally {
+      saveProcessedIds(processedIds);
+    }
+
+    Logger.log('Total rows written: ' + processed);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
@@ -197,10 +223,10 @@ function rollingDateFilter(days) {
 // Subject: "Citi Alerts - Credit Card/Ready Credit Transaction"
 // Sender:  alerts@citibank.com.sg
 // ─────────────────────────────────────────────────────────────
-function processCitiEmails(label, processedIds) {
+function processCitiEmails(label, processedIds, searchDays) {
   // Search all Citi threads (including already-labelled ones) so we can
   // process new messages that arrived after the thread was first labelled.
-  var query = 'from:alerts@citibank.com.sg subject:"Citi Alerts - Credit Card" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
+  var query = 'from:alerts@citibank.com.sg subject:"Citi Alerts - Credit Card" ' + rollingDateFilter(searchDays);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -234,10 +260,11 @@ function processCitiEmails(label, processedIds) {
       var txnDetailMatch= body.match(/Transaction\s+details\s*:[\s\n]*(.+)/i);
 
       if (!txnAmtMatch || !txnDetailMatch) {
-        Logger.log('Citi: could not parse email — skipping. Subject: ' + msg.getSubject());
+        Logger.log('Citi: could not parse email. Subject: ' + msg.getSubject());
         // Log first 400 chars of normalised body to help diagnose format changes
         Logger.log('Body (first 400 chars): ' + body.substring(0, 400));
-        markProcessed(processedIds, msg); // mark as seen so we don't retry
+        var citiStubCard = /citi[\s\-]*cash[\s\-]*back\+/i.test(body) ? 'CitiCashback+' : 'CitiRewards';
+        writeParseFailureStub(msg, citiStubCard, processedIds);
         continue;
       }
 
@@ -256,8 +283,7 @@ function processCitiEmails(label, processedIds) {
       // ── Amaze detection ────────────────────────────────
       var isAmaze  = /^AMAZE\*/i.test(rawDetail) || /INSTAREM/i.test(rawDetail);
       var context  = rawDetail.replace(/^AMAZE\*\s*/i, '').replace(/^INSTAREM\s*/i, '').trim();
-      // Clean trailing country code (e.g. "Singapore SGP" → "Singapore")
-      context = context.replace(/\s+[A-Z]{3}$/, '').trim();
+      context = stripTrailingCountry(context);
       context = normalizeContext(context);
 
       // Detect card type from email body.
@@ -277,6 +303,14 @@ function processCitiEmails(label, processedIds) {
       var reward   = isCashbackCard
         ? calcCitiCashbackReward(conv.amount)
         : calcCitiReward(context, currency, conv.amount, isAmaze);
+
+      // FX fetch failed → conv still holds the FOREIGN amount. Don't let it
+      // masquerade as SGD or earn a reward computed on the wrong number —
+      // surface it on the review queue instead.
+      if (conv.currency !== 'SGD') {
+        category = '⚠️ REVIEW';
+        reward   = { bonusEligible: '⚠️', rate: '', estReward: 0 };
+      }
 
       var row = buildRow(txnDate, conv.amount, category, displayContext, card, conv.currency,
                          reward.bonusEligible, reward.rate, reward.estReward, remarks);
@@ -305,9 +339,9 @@ function processCitiEmails(label, processedIds) {
 // Sender: ibanking.alert@dbs.com
 // Subjects: "PayNow" OR "iBanking Alerts" (both used by DBS)
 // ─────────────────────────────────────────────────────────────
-function processPOSBPayNowEmails(label, processedIds) {
+function processPOSBPayNowEmails(label, processedIds, searchDays) {
   // DBS sends PayNow confirmations under two subject lines — search both.
-  var query = 'from:ibanking.alert@dbs.com (subject:PayNow OR subject:"iBanking Alerts") ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
+  var query = 'from:ibanking.alert@dbs.com (subject:PayNow OR subject:"iBanking Alerts") ' + rollingDateFilter(searchDays);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -339,8 +373,8 @@ function processPOSBPayNowEmails(label, processedIds) {
       var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(\d{1,2}\s+[A-Za-z]{3})/i);
 
       if (!amtMatch) {
-        Logger.log('POSB PayNow: could not parse amount — skipping.');
-        markProcessed(processedIds, msg);
+        Logger.log('POSB PayNow: could not parse amount. Subject: ' + msg.getSubject());
+        writeParseFailureStub(msg, 'POSB Savings', processedIds);
         continue;
       }
 
@@ -377,8 +411,8 @@ function processPOSBPayNowEmails(label, processedIds) {
 // Email is table-based HTML; plain text has label and value on
 // separate lines (no colon), so regex uses \s+ between them.
 // ─────────────────────────────────────────────────────────────
-function processHSBCEmails(label, processedIds) {
-  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
+function processHSBCEmails(label, processedIds, searchDays) {
+  var query = 'from:HSBC.Bank.Singapore.Limited@notification.hsbc.com.hk subject:"Transaction Alerts" ' + rollingDateFilter(searchDays);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -406,16 +440,16 @@ function processHSBCEmails(label, processedIds) {
       var descMatch    = body.match(/Description\s*:?\s+([^\n\r]+)/i);
 
       if (!txnAmtMatch || !descMatch) {
-        Logger.log('HSBC: could not parse email — skipping. Subject: ' + msg.getSubject());
+        Logger.log('HSBC: could not parse email. Subject: ' + msg.getSubject());
         Logger.log('HSBC body (first 800 chars):\n' + body.substring(0, 800));
-        markProcessed(processedIds, msg); // prevent infinite retries
+        writeParseFailureStub(msg, 'HSBC Revolution', processedIds);
         continue;
       }
 
       var txnDate  = txnDateMatch ? parseHSBCDate(txnDateMatch[1]) : emailDate;
       var currency = txnAmtMatch[1].toUpperCase();
       var amount   = parseFloat(txnAmtMatch[2].replace(/,/g, ''));
-      var context  = normalizeContext(descMatch[1].replace(/\s+/g, ' ').trim());
+      var context  = normalizeContext(stripTrailingCountry(descMatch[1].replace(/\s+/g, ' ').trim()));
 
       var card     = 'HSBC Revolution';
       autoRegisterMerchant(context);
@@ -425,6 +459,12 @@ function processHSBCEmails(label, processedIds) {
       // Convert foreign amounts to SGD; reward maths uses the SGD value.
       var conv     = toSGD(amount, currency);
       var reward   = calcHSBCReward(context, currency, conv.amount);
+
+      // FX fetch failed → amount is still foreign; flag for review, no reward.
+      if (conv.currency !== 'SGD') {
+        category = '⚠️ REVIEW';
+        reward   = { bonusEligible: '⚠️', rate: '', estReward: 0 };
+      }
 
       var row = buildRow(txnDate, conv.amount, category, displayContext, card, conv.currency,
                          reward.bonusEligible, reward.rate, reward.estReward, conv.remark);
@@ -453,8 +493,8 @@ function processHSBCEmails(label, processedIds) {
 // Sender:  ibanking.alert@dbs.com
 // Only processes transactions for card ending 9299.
 // ─────────────────────────────────────────────────────────────
-function processPOSBEverydayEmails(label, processedIds) {
-  var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" ' + rollingDateFilter(ROLLING_WINDOW_DAYS);
+function processPOSBEverydayEmails(label, processedIds, searchDays) {
+  var query = 'from:ibanking.alert@dbs.com subject:"Card Transaction Alert" ' + rollingDateFilter(searchDays);
   var threads = GmailApp.search(query);
   var count = 0;
 
@@ -475,13 +515,14 @@ function processPOSBEverydayEmails(label, processedIds) {
         continue;
       }
 
-      var amtMatch  = body.match(/Amount\s*:\s*([A-Z]{3})([\d,]+\.?\d*)/i);
+      // \s* between currency and digits: DBS uses both "SGD0.10" and "SGD 0.10"
+      var amtMatch  = body.match(/Amount\s*:\s*([A-Z]{3})\s*([\d,]+\.?\d*)/i);
       var toMatch   = body.match(/To\s*:\s*(.+)/i);
       var dateMatch = body.match(/Date\s*(?:&|and)?\s*Time\s*:\s*(.+)/i);
 
       if (!amtMatch) {
-        Logger.log('POSB Everyday: could not parse amount — skipping.');
-        markProcessed(processedIds, msg);
+        Logger.log('POSB Everyday: could not parse amount. Subject: ' + msg.getSubject());
+        writeParseFailureStub(msg, 'POSB Everyday', processedIds);
         continue;
       }
 
@@ -489,9 +530,9 @@ function processPOSBEverydayEmails(label, processedIds) {
       var amount   = parseFloat(amtMatch[2].replace(/,/g, ''));
       var txnDate  = dateMatch ? parsePOSBCardDate(dateMatch[1]) : msg.getDate();
 
-      // Strip trailing 3-letter country code from merchant name (e.g. "BUS/MRT SINGAPORE SGP")
+      // Strip trailing country code from merchant name (e.g. "BUS/MRT SINGAPORE SGP")
       var rawMerchant = toMatch ? toMatch[1].trim() : 'Unknown';
-      var context     = normalizeContext(rawMerchant.replace(/\s+[A-Z]{3}$/, '').trim());
+      var context     = normalizeContext(stripTrailingCountry(rawMerchant));
 
       autoRegisterMerchant(context);
       var displayContext = resolveContext(context);
@@ -502,6 +543,13 @@ function processPOSBEverydayEmails(label, processedIds) {
       // but the cashback maths and recorded amount use the converted SGD value.
       var conv     = toSGD(amount, currency);
       var reward   = calcPOSBEverydayReward(context, currency, conv.amount);
+
+      // FX fetch failed → amount is still foreign; flag for review, no reward.
+      if (conv.currency !== 'SGD') {
+        category = '⚠️ REVIEW';
+        reward   = { bonusEligible: '⚠️', rate: '', estReward: 0, remark: '' };
+      }
+
       var remarks  = joinRemarks(reward.remark, conv.remark);
 
       var row = buildRow(txnDate, conv.amount, category, displayContext, 'POSB Everyday', conv.currency,
@@ -539,8 +587,8 @@ function calcCitiReward(merchant, currency, amount, isAmaze) {
   // Miles rounded down to nearest SGD1 per T&C clause 13
   var wholeAmt = Math.floor(amount);
 
-  // FCY note — for non-SGD spend the estimate uses the foreign amount as if it
-  // were SGD (we have no FX rate from the email), so flag it as approximate.
+  // FCY note — non-SGD spend is converted to SGD upstream (toSGD) before it
+  // reaches here; the note flags that the estimate rests on a live FX rate.
   var fcyNote = (currency !== 'SGD') ? ' (FCY est.)' : '';
 
   // Step 1: Hard exclusions (travel MCCs, mobile wallets) — always base rate
@@ -581,7 +629,8 @@ function calcHSBCReward(merchant, currency, amount) {
   var upper    = merchant.toUpperCase();
   var wholeAmt = Math.floor(amount);  // miles rounded down to nearest SGD1 per T&C clause 8
 
-  // FCY note — non-SGD estimate uses the foreign amount as if SGD (no FX rate).
+  // FCY note — non-SGD spend is converted to SGD upstream (toSGD) before it
+  // reaches here; the note flags that the estimate rests on a live FX rate.
   var fcyNote = (currency !== 'SGD') ? ' (FCY est.)' : '';
 
   // Step 1: Exclusions (fast food, food delivery, OTAs, transit) — always base rate
@@ -596,6 +645,16 @@ function calcHSBCReward(merchant, currency, amount) {
   }
   if (record && record.hsbcEligible === 'NO') {
     return { bonusEligible: 'NO', rate: '0.4 mpd', estReward: round2(wholeAmt * 0.4) };
+  }
+
+  // Step 2b: GRAB* — normalizeContext collapses every Grab charge (rides AND
+  // GrabFood) to "GRAB*", and the two earn opposite rates on this card (rides
+  // 4 mpd via the GRAB keyword, GrabFood excluded at 0.4 mpd). The descriptor
+  // can't tell them apart, so flag for review at base rate instead of letting
+  // the keyword list award 4 mpd to food delivery. A Merchants-table row for
+  // GRAB* (Step 2) still overrides this if you decide one way.
+  if (/^GRAB\*/.test(upper)) {
+    return { bonusEligible: '⚠️', rate: '0.4 mpd (Grab ride/food?)', estReward: round2(wholeAmt * 0.4) };
   }
 
   // Step 3: Bonus keyword fallback — earn 4 mpd (both contactless + online, restored Apr 2026)
@@ -613,6 +672,13 @@ function calcPOSBEverydayReward(merchant, currency, amount) {
   // MYR in-store: 10% (needs $800 min spend)
   if (currency === 'MYR') {
     return { bonusEligible: '\u26a0\ufe0f', rate: '10% MYR', estReward: round2(amount * 0.10), remark: 'Needs $800 min spend' };
+  }
+
+  // GRAB* is ambiguous after normalizeContext (ride vs GrabFood) — GrabFood
+  // would earn the 10% delivery tier, rides only base. Flag for review at the
+  // base rate rather than guessing 10%.
+  if (/^GRAB\*/.test(upper)) {
+    return { bonusEligible: '⚠️', rate: '0.3% (Grab ride/food?)', estReward: round2(amount * 0.003), remark: 'Grab: fix tier after review' };
   }
 
   // Food delivery: 10% (needs $800 min spend)
@@ -688,21 +754,28 @@ function getMerchantsTable() {
 }
 
 /**
- * Return the first Merchants row whose matchKey is a substring of
- * the given merchant name (case-insensitive).  Returns null if not found.
+ * Return the Merchants row whose matchKey matches the merchant name.
+ * Matching is word-start anchored (same rule as containsKeyword), so a short
+ * key like "SPC" can't fire mid-word, and when several keys match the LONGEST
+ * one wins ("GRABPAY" beats "GRAB") instead of whichever row happens to sit
+ * higher in the sheet. Returns null if nothing matches.
  */
 function lookupMerchant(merchantName) {
   var upper   = merchantName.toUpperCase();
   var records = getMerchantsTable();
+  var best    = null;
   for (var i = 0; i < records.length; i++) {
-    if (upper.indexOf(records[i].matchKey) !== -1) return records[i];
+    if (containsKeyword(upper, records[i].matchKey) &&
+        (!best || records[i].matchKey.length > best.matchKey.length)) {
+      best = records[i];
+    }
   }
-  return null;
+  return best;
 }
 
 // MCC Explorer API removed — did not reliably identify Singapore merchants.
 // MCC lookup is now done manually: user provides merchant→MCC groupings,
-// which are batch-loaded via runBulkImport().
+// which are batch-loaded via runSheetImport().
 
 
 /**
@@ -757,8 +830,10 @@ function mccToCitiOnline(mcc) {
 }
 
 /**
- * Append a new row to the Merchants tab and clear the in-memory cache
- * so subsequent lookups within the same run see the new entry.
+ * Append a new row to the Merchants tab and add it to the in-memory cache so
+ * subsequent lookups within the same run see the new entry. (Nulling the
+ * cache here used to force a full re-read of the Merchants tab after every
+ * new merchant — O(n²) sheet reads during bulk imports.)
  */
 function addMerchantToTable(matchKey, displayName, category, hsbcEligible, citiOnline, mcc, notes) {
   // Skip if this merchant is already in the table — prevents duplicate rows
@@ -781,13 +856,72 @@ function addMerchantToTable(matchKey, displayName, category, hsbcEligible, citiO
     mcc,
     notes
   ]);
-  _merchantsCache = null;   // force reload on next lookup
+  if (_merchantsCache) {
+    _merchantsCache.push({
+      matchKey:     matchKey.toUpperCase().trim(),
+      displayName:  displayName ? String(displayName).trim() : '',
+      category:     category ? String(category).trim() : '',
+      hsbcEligible: hsbcEligible ? String(hsbcEligible).toUpperCase().trim() : '',
+      citiOnline:   citiOnline ? String(citiOnline).toUpperCase().trim() : '',
+      mcc:          mcc ? String(mcc).trim() : '',
+      notes:        notes ? String(notes).trim() : ''
+    });
+  }
   Logger.log('Added to Merchants tab: ' + matchKey);
 }
 
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * Email yourself when something breaks. Throttled to one email per distinct
+ * subject per 6 hours (CacheService) so a broken parser can't flood the inbox.
+ * Failure paths used to be Logger.log-only, which nobody reads — a bank
+ * changing its email template would have dropped transactions with no symptom.
+ */
+function notifyError(subject, detail) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var key = 'err_' + subject.replace(/\W+/g, '_').substring(0, 90);
+    if (cache.get(key)) return;
+    cache.put(key, '1', 6 * 3600);
+    MailApp.sendEmail(Session.getEffectiveUser().getEmail(),
+                      '[Expense Tracker] ' + subject, detail);
+  } catch (e) {
+    Logger.log('notifyError failed (' + subject + '): ' + e);
+  }
+}
+
+/**
+ * A parser hit an email it could not read (bank changed the template, new
+ * alert variant, …). Instead of marking it processed and losing the
+ * transaction forever, write a ⚠️ REVIEW stub row carrying the email's date
+ * and subject, and send an alert. The message is only marked processed once
+ * the stub is safely in the sheet — if the write fails, next run retries.
+ */
+function writeParseFailureStub(msg, cardLabel, processedIds) {
+  var row = buildRow(msg.getDate(), 0, '⚠️ REVIEW',
+                     'PARSE FAILED: ' + msg.getSubject(), cardLabel, 'SGD',
+                     'NO', '', 0,
+                     'Parser could not read this email — find it in Gmail and enter the amount manually');
+  if (writeRow(row)) {
+    markProcessed(processedIds, msg);
+  }
+  notifyError(cardLabel + ' parse failure',
+              'Could not parse "' + msg.getSubject() + '" (' + msg.getDate() + ').\n' +
+              'A ⚠️ REVIEW stub row (amount 0) was written to the sheet.\n' +
+              'The bank may have changed its email template — check the execution log.');
+}
+
+// ISO alpha-3 codes that appear as trailing country markers on card
+// descriptors. A bare /[A-Z]{3}$/ strip also chopped real merchant words
+// ("GONG CHA" → "GONG"), so only strip a known country code.
+var TRAILING_COUNTRY_RE = /\s+(SGP|MYS|JPN|THA|IDN|VNM|PHL|KHM|MMR|LKA|IND|CHN|HKG|TWN|KOR|MAC|AUS|NZL|USA|CAN|GBR|IRL|FRA|DEU|NLD|BEL|LUX|CHE|AUT|ITA|ESP|PRT|GRC|TUR|ARE|QAT|SAU|DNK|SWE|NOR|FIN|ISL)\s*$/i;
+
+function stripTrailingCountry(s) {
+  return s.replace(TRAILING_COUNTRY_RE, '').trim();
+}
 
 /**
  * Strips location suffixes from merchant strings so that one Merchants table
@@ -874,7 +1008,7 @@ function resolveContext(rawMerchant) {
 
 /**
  * Registers a merchant in the Merchants table the first time it is seen.
- * All fields are left blank for the user to fill in via runBulkImport() or manually.
+ * All fields are left blank for the user to fill in via runSheetImport() or manually.
  * Safe to call on every transaction — skips silently if merchant already exists.
  */
 function autoRegisterMerchant(rawMerchant) {
@@ -892,18 +1026,6 @@ function autoRegisterMerchant(rawMerchant) {
   );
 }
 
-/**
- * One-shot bulk import of known merchants into the Merchants tab.
- * Merchant data is provided manually (MCC looked up from mccexplorer.com).
- * Run once from the Apps Script editor; safe to re-run — duplicate guard skips existing rows.
- *
- * To add a new batch: update the merchants array below and run again.
- *
- * Data format:
- *   { matchKey, displayName, category, mcc }
- *   matchKey  — uppercase substring that will match against raw email merchant names
- *   mcc       — drives HSBC Eligible (col D) and Citi Online (col E) automatically
- */
 /**
  * Sheet-driven bulk import. Reads from the "BulkImport" tab.
  * Columns: A = Merchant Name | B = MCC | C = Category (optional, defaults to "Food")
@@ -994,6 +1116,9 @@ function writeRow(row) {
     var sheet = ss.getSheetByName(TAB_NAME);
     if (!sheet) {
       Logger.log('ERROR: Sheet tab "' + TAB_NAME + '" not found!');
+      notifyError('Sheet tab "' + TAB_NAME + '" not found',
+                  'writeRow() cannot find the Transactions tab. The pipeline is ' +
+                  'stalled (rows are retried each run) until the tab is restored.');
       return false;
     }
     sheet.appendRow(row);
@@ -1001,6 +1126,8 @@ function writeRow(row) {
     return true;
   } catch (e) {
     Logger.log('ERROR writing row: ' + e.toString());
+    notifyError('Sheet write failing',
+                'writeRow() threw: ' + e + '\nThe row will be retried on the next run.');
     return false;
   }
 }
@@ -1022,8 +1149,17 @@ function epochDay(date) {
  * count, which is what guarantees an email still inside the search window is
  * never forgotten and re-written as a duplicate.
  */
+var _marksSinceSave = 0;
+
 function markProcessed(processedIds, msg) {
   processedIds[msg.getId()] = epochDay(msg.getDate());
+  // Periodic save: Apps Script's hard 6-minute kill skips finally blocks, so
+  // without this a timeout mid-backlog would forget every row written this
+  // run and duplicate them all next run. Now at most ~10 marks are at risk.
+  if (++_marksSinceSave >= 10) {
+    _marksSinceSave = 0;
+    saveProcessedIds(processedIds);
+  }
 }
 
 /**
@@ -1046,8 +1182,13 @@ function loadProcessedIds() {
     }
     return map;
   } catch (e) {
-    Logger.log('loadProcessedIds: parse error, resetting. ' + e);
-    return {};
+    // A corrupt store must ABORT the run: returning {} would re-process every
+    // email in the search window and write them all as duplicate rows.
+    notifyError('processedMsgIds store corrupted',
+                'JSON parse failed: ' + e + '\nRaw value (first 500 chars): ' +
+                String(raw).substring(0, 500) +
+                '\nRuns are halted until the "processedMsgIds" Script Property is fixed or deleted.');
+    throw new Error('loadProcessedIds: corrupt store — aborting to avoid duplicate rows: ' + e);
   }
 }
 
@@ -1073,9 +1214,12 @@ function saveProcessedIds(map) {
     if (day >= cutoff) kept[keys[i]] = day;
   }
 
-  // Safety net against the 9 KB property limit: keep the newest by day.
+  // Safety net against the 9 KB per-property limit: keep the newest by day.
+  // 300 entries ≈ 8 KB of JSON — the previous cap of 450 could EXCEED 9 KB,
+  // making setProperty throw and lose every ID from the run. Trimming can
+  // evict IDs still inside the search window, so it alerts when it fires.
   var keptKeys = Object.keys(kept);
-  var MAX_IDS = 450;
+  var MAX_IDS = 300;
   if (keptKeys.length > MAX_IDS) {
     keptKeys.sort(function(a, b) { return kept[a] - kept[b]; }); // oldest first
     var trimmed = {};
@@ -1083,9 +1227,20 @@ function saveProcessedIds(map) {
       trimmed[keptKeys[k]] = kept[keptKeys[k]];
     }
     kept = trimmed;
+    notifyError('processedMsgIds trimmed to ' + MAX_IDS + ' entries',
+                'The processed-ID store hit its size cap. IDs still inside the ' +
+                ROLLING_WINDOW_DAYS + '-day search window may have been evicted — ' +
+                'watch the sheet for duplicate rows.');
   }
 
-  PropertiesService.getScriptProperties().setProperty('processedMsgIds', JSON.stringify(kept));
+  try {
+    PropertiesService.getScriptProperties().setProperty('processedMsgIds', JSON.stringify(kept));
+  } catch (e) {
+    // This runs inside finally blocks — alert before rethrowing, because a
+    // failed save means every row from this run gets duplicated next run.
+    notifyError('Failed to save processed-ID store', String(e));
+    throw e;
+  }
 }
 
 // Parse "DD/MM/YY" (Citi format) → Date
@@ -1126,7 +1281,9 @@ function parseHSBCDate(str) {
   // new Date("11 APR 2026") is understood by V8
   var parts = str.split('/');
   if (parts.length !== 3) return new Date();
-  return new Date(parts[0] + ' ' + parts[1] + ' ' + parts[2]);
+  var d = new Date(parts[0] + ' ' + parts[1] + ' ' + parts[2]);
+  // Invalid Date would otherwise write "NaN/undefined/NaN" into the sheet
+  return isNaN(d.getTime()) ? new Date() : d;
 }
 
 // Parse "11 APR 19:58 (SGT)" (POSB Everyday format) → Date
@@ -1217,6 +1374,9 @@ function toSGD(amount, currency) {
 
   var rate = getFxRate(currency);
   if (!rate) {
+    notifyError('FX rate unavailable for ' + currency,
+                'open.er-api.com lookup failed. The transaction was written as a ' +
+                '⚠️ REVIEW row with the original ' + currency + ' amount and no reward.');
     return {
       amount: amount,
       currency: currency,

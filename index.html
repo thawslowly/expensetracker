@@ -435,6 +435,28 @@ const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct
 let allTxns = [];
 let charts = {};
 let currentTab = 'overview';
+let loadError = null;
+
+/* ── Escaping ── */
+// Context/remarks come straight from parsed emails — escape before innerHTML
+// so a merchant name containing <, & or quotes can't break or script the page.
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ── Amounts ── */
+// Amounts are SGD except rows whose FX conversion failed upstream (their
+// Currency column keeps the foreign code). A ¥10,000 row must not add $10,000
+// to SGD totals, so non-SGD rows are excluded from every sum and counted
+// separately for a visible note.
+function sgdAmt(t) {
+  if (t.currency && t.currency !== 'SGD') return 0;
+  return parseFloat(t.amount) || 0;
+}
+function fcyCount(txns) {
+  return txns.filter(t => t.currency && t.currency !== 'SGD').length;
+}
 
 /* ── Formatters ── */
 function fmt(n) {
@@ -456,8 +478,12 @@ function parseDate(d) {
   if (typeof d === 'string' && d.includes('/')) {
     const p = d.split('/');
     if (p.length === 3) {
-      const mon = isNaN(p[1]) ? MONTHS_SHORT.indexOf(p[1]) : parseInt(p[1]) - 1;
-      return new Date(parseInt(p[2]), mon, parseInt(p[0]));
+      // Case-insensitive month token; an unrecognised token used to yield
+      // month index -1 → a date in December of the PREVIOUS year.
+      const mon = isNaN(p[1])
+        ? MONTHS_SHORT.findIndex(m => m.toLowerCase() === String(p[1]).toLowerCase().slice(0, 3))
+        : parseInt(p[1]) - 1;
+      if (mon >= 0 && mon <= 11) return new Date(parseInt(p[2]), mon, parseInt(p[0]));
     }
   }
   return new Date(d);
@@ -494,6 +520,17 @@ function showTab(name) {
 }
 
 function renderTab(name) {
+  // A failed fetch must show the error in WHICHEVER tab is open — previously
+  // only Overview showed it, and other tabs rendered a plausible $0 dashboard.
+  if (loadError) {
+    document.getElementById('tab-' + name).innerHTML = `
+      <div class="error-box">
+        <p>Could not load data from Google Sheets.</p>
+        <p style="color:var(--text2);margin-top:8px;font-size:12px">${esc(loadError)}</p>
+        <p style="color:var(--text3);margin-top:12px;font-size:11px">Make sure your Apps Script is deployed with access set to "Anyone"</p>
+      </div>`;
+    return;
+  }
   if (name === 'overview') renderOverview();
   else if (name === 'cards') renderCards();
   else if (name === 'transactions') renderTransactions();
@@ -538,12 +575,12 @@ function detectAnomalies(curTxns, allMonthKeys) {
 
   Object.keys(BUDGET).forEach(cat => {
     const curSpend = curTxns.filter(t => t.category === cat)
-      .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+      .reduce((s, t) => s + sgdAmt(t), 0);
     if (curSpend < 10) return;
 
     const histAmounts = priorKeys.map(k =>
       allTxns.filter(t => getMonthKey(t.date) === k && t.category === cat)
-        .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0)
+        .reduce((s, t) => s + sgdAmt(t), 0)
     );
     const histAvg = histAmounts.reduce((a, b) => a + b, 0) / histAmounts.length;
     if (histAvg < 10) return;
@@ -564,10 +601,11 @@ function renderOverview() {
   const curTxns = allTxns.filter(t => getMonthKey(t.date) === curKey);
   const totalSpend = curTxns
     .filter(t => t.category !== 'Big Ticket')
-    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    .reduce((s, t) => s + sgdAmt(t), 0);
   const bigTicketSpend = curTxns
     .filter(t => t.category === 'Big Ticket')
-    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    .reduce((s, t) => s + sgdAmt(t), 0);
+  const fcyExcluded = fcyCount(curTxns);
   const totalBudget = Object.values(BUDGET).reduce((a, b) => a + b, 0);
   const reviewCount = curTxns.filter(t => t.category === '⚠️ REVIEW').length;
   const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
@@ -584,7 +622,7 @@ function renderOverview() {
   const prevKey = getPrevMonthKey(curKey);
   const prevSpend = allTxns
     .filter(t => getMonthKey(t.date) === prevKey && t.category !== 'Big Ticket')
-    .reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+    .reduce((s, t) => s + sgdAmt(t), 0);
   function momHtml(current, prev, label) {
     if (!prev) return '';
     const pct = Math.round((current - prev) / prev * 100);
@@ -600,7 +638,7 @@ function renderOverview() {
   const catSpend = {};
   curTxns.forEach(t => {
     const c = t.category || 'Uncategorised';
-    catSpend[c] = (catSpend[c] || 0) + (parseFloat(t.amount) || 0);
+    catSpend[c] = (catSpend[c] || 0) + sgdAmt(t);
   });
 
   const el = document.getElementById('tab-overview');
@@ -647,6 +685,11 @@ function renderOverview() {
       <button class="review-btn" onclick="showTab('transactions')">View</button>
     </div>` : ''}
 
+    ${fcyExcluded > 0 ? `
+    <div class="review-banner">
+      <span>⚠ ${fcyExcluded} foreign-currency transaction${fcyExcluded > 1 ? 's' : ''} (unconverted) excluded from totals — fix in Google Sheet</span>
+    </div>` : ''}
+
     <div class="two-col">
       <div class="card">
         <div class="card-title">Spending vs budget — ${curKey}</div>
@@ -685,7 +728,7 @@ function renderOverview() {
   const cols = cats.map(c => CAT_COLORS[c] || '#888780');
 
   document.getElementById('cat-legend').innerHTML = cats.map((c, i) =>
-    `<div class="legend-item"><div class="legend-dot" style="background:${cols[i]}"></div>${c} ${fmt(catSpend[c])}</div>`
+    `<div class="legend-item"><div class="legend-dot" style="background:${cols[i]}"></div>${esc(c)} ${fmt(catSpend[c])}</div>`
   ).join('');
 
   charts['cat'] = new Chart(document.getElementById('catChart'), {
@@ -915,22 +958,23 @@ function renderTransactions(selMonth, selCat, selCard) {
   const reviewCount = txns.filter(t => t.category === '⚠️ REVIEW').length;
   const cats  = [...new Set(allTxns.map(t => t.category).filter(Boolean))].sort();
   const cards = [...new Set(allTxns.map(t => t.card).filter(Boolean))].sort();
-  const total = txns.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  const total = txns.reduce((s, t) => s + sgdAmt(t), 0);
+  const fcyInView = fcyCount(txns);
 
   const el = document.getElementById('tab-transactions');
   el.innerHTML = `
     <div class="filter-row">
       <span class="filter-label">Filter:</span>
       <select id="f-month" onchange="refilter()">
-        ${months.map(m => `<option value="${m}" ${m===selMonth?'selected':''}>${m}</option>`).join('')}
+        ${months.map(m => `<option value="${esc(m)}" ${m===selMonth?'selected':''}>${esc(m)}</option>`).join('')}
       </select>
       <select id="f-cat" onchange="refilter()">
         <option value="all">All categories</option>
-        ${cats.map(c => `<option value="${c}" ${c===selCat?'selected':''}>${c}</option>`).join('')}
+        ${cats.map(c => `<option value="${esc(c)}" ${c===selCat?'selected':''}>${esc(c)}</option>`).join('')}
       </select>
       <select id="f-card" onchange="refilter()">
         <option value="all">All cards</option>
-        ${cards.map(c => `<option value="${c}" ${c===selCard?'selected':''}>${c}</option>`).join('')}
+        ${cards.map(c => `<option value="${esc(c)}" ${c===selCard?'selected':''}>${esc(c)}</option>`).join('')}
       </select>
     </div>
 
@@ -961,7 +1005,7 @@ function renderTransactions(selMonth, selCat, selCard) {
                   const iso = dt.getFullYear() + '-' + String(dt.getMonth()+1).padStart(2,'0') + '-' + String(dt.getDate()).padStart(2,'0');
                   if (!groups[iso]) groups[iso] = { label: fmtFullDate(dt), txns: [], total: 0 };
                   groups[iso].txns.push(t);
-                  groups[iso].total += parseFloat(t.amount) || 0;
+                  groups[iso].total += sgdAmt(t);
                 });
                 return Object.keys(groups).sort((a,b) => b.localeCompare(a)).map(iso => {
                   const g = groups[iso];
@@ -974,15 +1018,15 @@ function renderTransactions(selMonth, selCat, selCard) {
                     else                  eligBadge = `<span class="badge badge-chk">Check</span>`;
                     const catCol = CAT_COLORS[t.category] || '#888';
                     const fcyBadge = (t.currency && t.currency !== 'SGD')
-                      ? ` <span class="badge badge-fcy">${t.currency}</span>` : '';
+                      ? ` <span class="badge badge-fcy">${esc(t.currency)}</span>` : '';
                     return `<tr>
-                      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.context || '—'}</td>
+                      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.context) || '—'}</td>
                       <td style="text-align:right;white-space:nowrap"><span style="font-weight:500;font-variant-numeric:tabular-nums">${fmt(t.amount)}</span>${fcyBadge}</td>
-                      <td><span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:${catCol}22;color:${catCol}">${t.category || '—'}</span></td>
-                      <td style="font-size:11px;color:var(--text2);white-space:nowrap">${t.card || '—'}</td>
+                      <td><span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:${catCol}22;color:${catCol}">${esc(t.category) || '—'}</span></td>
+                      <td style="font-size:11px;color:var(--text2);white-space:nowrap">${esc(t.card) || '—'}</td>
                       <td>${eligBadge}</td>
-                      <td style="font-size:11px;color:var(--text2)">${t.rewardRate || '—'}</td>
-                      <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(t.remarks || '').replace(/"/g, '&quot;')}">${t.remarks || '—'}</td>
+                      <td style="font-size:11px;color:var(--text2)">${esc(t.rewardRate) || '—'}</td>
+                      <td style="font-size:11px;color:var(--text3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.remarks)}">${esc(t.remarks) || '—'}</td>
                     </tr>`;
                   }).join('');
                   return `<tr class="date-group-header">
@@ -995,7 +1039,7 @@ function renderTransactions(selMonth, selCat, selCard) {
           </tbody>
         </table>
       </div>
-      <div class="totals-row">${txns.length} transactions · Total: <strong>${fmt(total)}</strong></div>
+      <div class="totals-row">${txns.length} transactions · Total: <strong>${fmt(total)}</strong>${fcyInView > 0 ? ` · excludes ${fcyInView} unconverted FCY` : ''}</div>
     </div>
   `;
 }
@@ -1014,8 +1058,11 @@ function renderTrends() {
 
   allTxns.forEach(t => {
     const mk  = getMonthKey(t.date);
-    const amt = parseFloat(t.amount) || 0;
-    monthTotals[mk] = (monthTotals[mk] || 0) + amt;
+    const amt = sgdAmt(t);
+    // Bars/avg/best/worst exclude Big Ticket, matching Overview's definition
+    // of monthly spend — one furniture purchase shouldn't be a "worst month".
+    // The stacked category chart below still shows it as its own segment.
+    monthTotals[mk] = (monthTotals[mk] || 0) + (t.category === 'Big Ticket' ? 0 : amt);
     if (!monthCats[mk]) monthCats[mk] = {};
     const cat = t.category || 'Other';
     monthCats[mk][cat] = (monthCats[mk][cat] || 0) + amt;
@@ -1053,7 +1100,7 @@ function renderTrends() {
     <div class="card">
       <div class="card-title">Monthly total spend</div>
       <div class="legend" id="trend-legend">
-        <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Actual spend</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Actual spend (excl. Big Ticket)</div>
         <div class="legend-item"><div class="legend-dot" style="background:#E24B4A;border-radius:0;height:3px;width:16px;margin-top:3px"></div>Budget ${fmtShort(totalBudget)}/mo</div>
         <div class="legend-item"><div class="legend-dot" style="background:#EF9F27;border-radius:50%"></div>Expected pace (today)</div>
       </div>
@@ -1172,26 +1219,28 @@ function renderTrends() {
 /* ── Load data ── */
 async function loadData() {
   try {
-    const res  = await fetch(API);
+    const res = await fetch(API);
+    // Apps Script serves an HTML error page (often with status 200) when the
+    // script itself fails — check both status and content type before parsing.
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' from Apps Script');
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('json')) throw new Error('Apps Script returned ' + (ct || 'no content type') + ' instead of JSON — the script may have errored');
     const data = await res.json();
+    if (data.error) throw new Error(data.error);
 
-    allTxns = (data.transactions || []).filter(t => {
-      const amt = parseFloat(t.amount);
-      return !isNaN(amt) && amt > 0;
-    });
+    // Keep refunds/reversals (negative amounts) — dropping them overstated
+    // every total. Only rows with no numeric amount are excluded.
+    allTxns = (data.transactions || []).filter(t => !isNaN(parseFloat(t.amount)));
+    loadError = null;
 
     const now = new Date();
     document.getElementById('last-updated').textContent =
       'Updated ' + now.toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' });
 
-    renderTab('overview');
+    renderTab(currentTab);
   } catch (e) {
-    document.getElementById('tab-overview').innerHTML = `
-      <div class="error-box">
-        <p>Could not load data from Google Sheets.</p>
-        <p style="color:var(--text2);margin-top:8px;font-size:12px">${e.message}</p>
-        <p style="color:var(--text3);margin-top:12px;font-size:11px">Make sure your Apps Script is deployed with access set to "Anyone"</p>
-      </div>`;
+    loadError = e.message;
+    renderTab(currentTab);
   }
 }
 

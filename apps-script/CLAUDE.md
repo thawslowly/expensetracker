@@ -56,7 +56,7 @@ Tier cashback. S$800/month minimum spend to unlock bonus tiers. Base rate 0.3%.
 
 | Rule | Example input | Output |
 |------|---------------|--------|
-| GRAB* booking code | `GRAB* A-98IFM9CGWAWRAV SINGAPORE` | `GRAB*` |
+| GRAB* booking code | `GRAB* A-98IFM9CGWAWRAV SINGAPORE` | `GRAB*` — ⚠️ ride vs GrabFood is indistinguishable after this, so HSBC and POSB flag `GRAB*` for review at base rate instead of guessing (Citi is unaffected: both are online = 4 mpd). A `GRAB*` Merchants-table row overrides. |
 | `@` separator | `STARBUCKS@WEST COAST`, `KOPITIAM @VIVO` | `STARBUCKS`, `KOPITIAM` |
 | ` - ` separator (spaces both sides, safe for `7-ELEVEN`) | `CHICHA SAN CHEN - TAMP` | `CHICHA SAN CHEN` |
 | Trailing `SINGAPORE` / `SGP` | `SOME MERCHANT SINGAPORE` | `SOME MERCHANT` |
@@ -80,7 +80,8 @@ Persistent lookup table checked **before** keyword arrays. Checked via substring
 
 ### Key Functions
 - `normalizeContext(context)` — strips location suffixes before registration and lookup
-- `lookupMerchant(name)` — substring match; returns first matching record or null
+- `stripTrailingCountry(name)` — removes a trailing ISO country code (SGP, JPN, …) using a whitelist; the old bare `[A-Z]{3}$` strip chopped real words ("GONG CHA" → "GONG")
+- `lookupMerchant(name)` — word-start match (same rule as keyword lists, so "SPC" can't fire mid-word); when several keys match, the longest wins regardless of row order
 - `addMerchantToTable(...)` — appends row, skips duplicates, clears cache
 - `autoRegisterMerchant(raw)` — called on every new transaction; writes blank row (`Needs classification`) if merchant unknown
 - `mccToHsbcEligible(mcc)` — maps MCC → `YES`/`NO`/`''` per HSBC T&C
@@ -96,10 +97,20 @@ Paste merchant names into the `BulkImport` sheet tab (col A = name, col B = MCC,
 ## `doGet()` Endpoint
 Returns `{ transactions: [...] }` for `?action=transactions`. Also supports `?action=cap_usage` and `?action=card_config`. Optional `?month=Apr-2026` filter.
 
+## Failure Handling and Alerting (added 2026-07-18)
+
+- **`notifyError(subject, detail)`** emails you when something breaks, throttled to one email per distinct subject per 6 hours. Used by: parse failures, FX-rate fetch failures, sheet write failures, processed-ID store problems. First run after pasting this version will ask for a new **"Send email as you"** permission — approve it or alerts silently no-op.
+- **Parse failures are never silently dropped.** If a parser can't read an email (template change), `writeParseFailureStub()` writes a `⚠️ REVIEW` row (amount 0, context `PARSE FAILED: <subject>`) and emails you. The message is only marked processed once the stub is in the sheet.
+- **FX fetch failure** → the row keeps the foreign amount/currency but is forced to `⚠️ REVIEW` with estReward 0, so it can't inflate SGD totals or reward sums.
+
 ## Deduplication and Gmail Quota
 
 ### processedIds (Script Properties)
-Each successfully written message ID is stored in `PropertiesService` under `processedMsgIds`. `processEmails()` wraps all parser calls in `try-finally` so `saveProcessedIds()` is always called even if a Gmail quota error is thrown mid-run — this prevents duplicate rows on the next run.
+Each successfully written message ID is stored in `PropertiesService` under `processedMsgIds`.
+- `processEmails()` takes a **LockService script lock** — overlapping trigger runs skip instead of double-processing.
+- IDs are saved after every parser AND every ~10 marks (inside `markProcessed`), because Apps Script's hard 6-minute kill does **not** run `finally` blocks; the `finally` save still covers thrown errors (e.g. Gmail quota).
+- Store cap is **300 IDs** (~8 KB; the 9 KB property limit made the old 450 cap unsafe). If the cap ever trims still-searchable IDs, you get an alert email.
+- A corrupt store **aborts the run** (alert + throw) instead of resetting to `{}` — a reset would rewrite every email in the window as duplicate rows.
 
 ### Rolling date filter (`rollingDateFilter(days)`)
-All four Gmail search queries use `rollingDateFilter(30)` instead of a fixed `after:2026/04/01` date. This keeps the search window at a constant 30 days, preventing Gmail API quota from growing as the months pass. If you need to reprocess older emails, temporarily increase the window (e.g. `rollingDateFilter(90)`) and run once manually.
+Runs in the first 5 minutes of each hour sweep the full `ROLLING_WINDOW_DAYS` (30); all other runs scan `QUICK_SCAN_DAYS` (2), cutting Gmail reads ~10x with no data-loss risk (late-arriving mail is caught by the hourly sweep). If you need to reprocess older emails, temporarily increase `ROLLING_WINDOW_DAYS` (e.g. 90) and run once manually.
